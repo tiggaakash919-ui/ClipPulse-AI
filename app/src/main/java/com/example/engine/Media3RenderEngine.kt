@@ -7,25 +7,35 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.OpenableColumns
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.core.content.res.ResourcesCompat
+import androidx.media3.common.C
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.util.Clock
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.effect.BitmapOverlay
 import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.Presentation
 import androidx.media3.effect.TextureOverlay
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultDecoderFactory
+import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.Effects
+import androidx.media3.transformer.ExoPlayerAssetLoader
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
@@ -40,16 +50,62 @@ import com.google.common.collect.ImmutableList
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.File
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val TAG = "Media3RenderEngine"
+private const val DEFAULT_RENDER_USER_AGENT =
+    "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36"
 
 class Media3RenderEngine(private val context: Context) {
 
     @Volatile
     private var activeTransformer: Transformer? = null
+
+    private val downloadClient = OkHttpClient.Builder()
+        .connectTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
+
+    companion object {
+        /**
+         * Computes a safe [startMs, endMs] clipping window within [actualDurationMs], or null if
+         * the full asset should be rendered without clipping.
+         */
+        fun computeSafeTrimWindowMs(
+            clipStartSec: Long,
+            clipEndSec: Long,
+            actualDurationMs: Long?,
+            isPreSlicedFile: Boolean
+        ): Pair<Long, Long>? {
+            val requestedDurMs = ((clipEndSec - clipStartSec).coerceAtLeast(1L)) * 1000L
+            val rawStartMs = if (isPreSlicedFile) 0L else (clipStartSec * 1000L).coerceAtLeast(0L)
+            val rawEndMs = if (isPreSlicedFile) requestedDurMs else (clipEndSec * 1000L).coerceAtLeast(rawStartMs + 1000L)
+
+            if (actualDurationMs == null || actualDurationMs <= 0L) {
+                return if (isPreSlicedFile) null else rawStartMs to rawEndMs
+            }
+
+            if (actualDurationMs <= 1200L) {
+                return null
+            }
+
+            val clampedStart = rawStartMs.coerceIn(0L, (actualDurationMs - 1000L).coerceAtLeast(0L))
+            val clampedEnd = rawEndMs.coerceIn(clampedStart + 500L, actualDurationMs)
+
+            return if (clampedStart == 0L && clampedEnd >= actualDurationMs - 250L) {
+                null
+            } else {
+                clampedStart to clampedEnd
+            }
+        }
+    }
 
     @OptIn(UnstableApi::class)
     suspend fun renderVerticalShort(
@@ -57,118 +113,313 @@ class Media3RenderEngine(private val context: Context) {
         clip: ViralClip,
         captionWords: List<CaptionWord>,
         captionHighlight: CaptionHighlightColor = CaptionHighlightColor.VIBRANT_YELLOW,
+        isPreSlicedFile: Boolean = false,
+        httpUserAgent: String? = null,
         onProgress: (Float) -> Unit
-    ): File = withContext(Dispatchers.Main) {
-        val outputDir = File(context.cacheDir, "clipper/clips").apply { mkdirs() }
-        val outputFile = File(outputDir, "${clip.id}_9x16.mp4")
-        if (outputFile.exists()) outputFile.delete()
+    ): File {
+        val effectiveUa = httpUserAgent?.takeIf { it.isNotBlank() } ?: DEFAULT_RENDER_USER_AGENT
+        // Proactively stage content:// URIs <= 200 MB to local cache to prevent PhotoPicker / Scoped Storage AssetLoader failures
+        val initialUri = prepareSafeInputUri(inputUri, forceStageContent = false)
 
-        val startMs = (clip.startSec * 1000L).coerceAtLeast(0L)
-        val endMs = (clip.endSec * 1000L).coerceAtLeast(startMs + 1000L)
-
-        val mediaItem = MediaItem.Builder()
-            .setUri(inputUri)
-            .setClippingConfiguration(
-                MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs(startMs)
-                    .setEndPositionMs(endMs)
-                    .build()
+        return try {
+            executeTransformerRender(
+                resolvedUri = initialUri,
+                clip = clip,
+                captionWords = captionWords,
+                captionHighlight = captionHighlight,
+                isPreSlicedFile = isPreSlicedFile,
+                userAgent = effectiveUa,
+                onProgress = onProgress
             )
-            .build()
+        } catch (primaryError: Exception) {
+            val scheme = initialUri.scheme.orEmpty().lowercase()
+            val canFallbackStageContent = scheme == "content"
+            val canFallbackDownloadHttp = (scheme == "http" || scheme == "https") &&
+                !initialUri.toString().contains(".m3u8", ignoreCase = true)
 
-        val layoutMode = when (clip.layoutPresetEnum()) {
-            LayoutPreset.CINEMA_BLUR -> Presentation.LAYOUT_SCALE_TO_FIT
-            LayoutPreset.WORD_POP, LayoutPreset.SPLIT_SCREEN, LayoutPreset.FULL_CROP ->
-                Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP
-        }
+            if (canFallbackStageContent) {
+                Log.w(TAG, "Direct content:// render failed, staging to cache and retrying", primaryError)
+                onProgress(0.05f)
+                val cachedLocalUri = prepareSafeInputUri(initialUri, forceStageContent = true)
+                return executeTransformerRender(
+                    resolvedUri = cachedLocalUri,
+                    clip = clip,
+                    captionWords = captionWords,
+                    captionHighlight = captionHighlight,
+                    isPreSlicedFile = isPreSlicedFile,
+                    userAgent = effectiveUa,
+                    onProgress = onProgress
+                )
+            }
 
-        val presentationEffect = Presentation.createForWidthAndHeight(
-            1080,
-            1920,
-            layoutMode
-        )
-
-        val dynamicOverlay = ShortsDynamicBitmapOverlay(
-            context = context,
-            clip = clip,
-            words = captionWords,
-            captionHighlight = captionHighlight
-        )
-        val overlayEffect = OverlayEffect(ImmutableList.of<TextureOverlay>(dynamicOverlay))
-
-        val videoEffects: List<Effect> = listOf(presentationEffect, overlayEffect)
-        val editedMediaItem = EditedMediaItem.Builder(mediaItem)
-            .setEffects(Effects(emptyList(), videoEffects))
-            .build()
-
-        val composition = Composition.Builder(
-            EditedMediaItemSequence.Builder(editedMediaItem).build()
-        ).build()
-
-        suspendCancellableCoroutine { cont ->
-            val mainHandler = Handler(Looper.getMainLooper())
-            var finished = false
-            val progressHolder = ProgressHolder()
-            lateinit var transformer: Transformer
-
-            val progressPoller = object : Runnable {
-                override fun run() {
-                    if (finished) return
-                    val state = transformer.getProgress(progressHolder)
-                    if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
-                        onProgress((progressHolder.progress / 100f).coerceIn(0f, 0.99f))
-                    }
-                    if (!finished && state != Transformer.PROGRESS_STATE_NOT_STARTED) {
-                        mainHandler.postDelayed(this, 250L)
-                    }
+            if (canFallbackDownloadHttp) {
+                Log.w(TAG, "Direct HTTP stream render failed, caching remote MP4 to disk and retrying", primaryError)
+                onProgress(0.05f)
+                val cachedRemoteUri = downloadRemoteToCache(initialUri, effectiveUa)
+                if (cachedRemoteUri != null) {
+                    return executeTransformerRender(
+                        resolvedUri = cachedRemoteUri,
+                        clip = clip,
+                        captionWords = captionWords,
+                        captionHighlight = captionHighlight,
+                        isPreSlicedFile = isPreSlicedFile,
+                        userAgent = effectiveUa,
+                        onProgress = onProgress
+                    )
                 }
             }
 
-            transformer = Transformer.Builder(context)
-                .setVideoMimeType(MimeTypes.VIDEO_H264)
-                .setAudioMimeType(MimeTypes.AUDIO_AAC)
-                .addListener(object : Transformer.Listener {
-                    override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                        finished = true
-                        activeTransformer = null
-                        mainHandler.removeCallbacks(progressPoller)
-                        onProgress(1f)
-                        if (cont.isActive) cont.resume(outputFile)
-                    }
+            throw IllegalStateException(formatExportFailure(primaryError), primaryError)
+        }
+    }
 
-                    override fun onError(
-                        composition: Composition,
-                        exportResult: ExportResult,
-                        exportException: ExportException
-                    ) {
-                        finished = true
-                        activeTransformer = null
-                        mainHandler.removeCallbacks(progressPoller)
-                        Log.e(TAG, "Media3 export failed", exportException)
-                        if (cont.isActive) cont.resumeWithException(exportException)
-                    }
-                })
+    @OptIn(UnstableApi::class)
+    private suspend fun executeTransformerRender(
+        resolvedUri: Uri,
+        clip: ViralClip,
+        captionWords: List<CaptionWord>,
+        captionHighlight: CaptionHighlightColor,
+        isPreSlicedFile: Boolean,
+        userAgent: String,
+        onProgress: (Float) -> Unit
+    ): File {
+        val actualDurationMs = withContext(Dispatchers.IO) { probeDurationMs(resolvedUri, userAgent) }
+        val trimWindow = computeSafeTrimWindowMs(
+            clipStartSec = clip.startSec,
+            clipEndSec = clip.endSec,
+            actualDurationMs = actualDurationMs,
+            isPreSlicedFile = isPreSlicedFile
+        )
+
+        return withContext(Dispatchers.Main) {
+            val outputDir = File(context.cacheDir, "clipper/clips").apply { mkdirs() }
+            val outputFile = File(outputDir, "${clip.id}_9x16.mp4")
+            if (outputFile.exists()) outputFile.delete()
+
+            val mediaItemBuilder = MediaItem.Builder().setUri(resolvedUri)
+            if (trimWindow != null) {
+                mediaItemBuilder.setClippingConfiguration(
+                    MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(trimWindow.first)
+                        .setEndPositionMs(trimWindow.second)
+                        .build()
+                )
+            }
+            val mediaItem = mediaItemBuilder.build()
+
+            val layoutMode = when (clip.layoutPresetEnum()) {
+                LayoutPreset.CINEMA_BLUR -> Presentation.LAYOUT_SCALE_TO_FIT
+                LayoutPreset.WORD_POP, LayoutPreset.SPLIT_SCREEN, LayoutPreset.FULL_CROP ->
+                    Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP
+            }
+
+            val presentationEffect = Presentation.createForWidthAndHeight(
+                1080,
+                1920,
+                layoutMode
+            )
+
+            val dynamicOverlay = ShortsDynamicBitmapOverlay(
+                context = context,
+                clip = clip,
+                words = captionWords,
+                captionHighlight = captionHighlight
+            )
+            val overlayEffect = OverlayEffect(ImmutableList.of<TextureOverlay>(dynamicOverlay))
+
+            val videoEffects: List<Effect> = listOf(presentationEffect, overlayEffect)
+            val editedMediaItem = EditedMediaItem.Builder(mediaItem)
+                .setEffects(Effects(emptyList(), videoEffects))
                 .build()
 
-            activeTransformer = transformer
+            val composition = Composition.Builder(
+                EditedMediaItemSequence.Builder(editedMediaItem).build()
+            ).build()
 
-            cont.invokeOnCancellation {
-                finished = true
-                activeTransformer = null
-                mainHandler.removeCallbacks(progressPoller)
-                runCatching { transformer.cancel() }
-            }
+            val httpFactory = DefaultHttpDataSource.Factory()
+                .setUserAgent(userAgent)
+                .setAllowCrossProtocolRedirects(true)
+                .setConnectTimeoutMs(20_000)
+                .setReadTimeoutMs(30_000)
+            val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
+            val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
+            val decoderFactory = DefaultDecoderFactory.Builder(context).build()
+            val assetLoaderFactory = ExoPlayerAssetLoader.Factory(
+                context,
+                decoderFactory,
+                Clock.DEFAULT,
+                mediaSourceFactory
+            )
+            val encoderFactory = DefaultEncoderFactory.Builder(context)
+                .setEnableFallback(true)
+                .build()
 
-            try {
-                transformer.start(composition, outputFile.absolutePath)
-                mainHandler.postDelayed(progressPoller, 250L)
-            } catch (e: Exception) {
-                finished = true
-                activeTransformer = null
-                mainHandler.removeCallbacks(progressPoller)
-                if (cont.isActive) cont.resumeWithException(e)
+            suspendCancellableCoroutine { cont ->
+                val mainHandler = Handler(Looper.getMainLooper())
+                var finished = false
+                val progressHolder = ProgressHolder()
+                lateinit var transformer: Transformer
+
+                val progressPoller = object : Runnable {
+                    override fun run() {
+                        if (finished) return
+                        val state = transformer.getProgress(progressHolder)
+                        if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
+                            onProgress((progressHolder.progress / 100f).coerceIn(0f, 0.99f))
+                        }
+                        if (!finished && state != Transformer.PROGRESS_STATE_NOT_STARTED) {
+                            mainHandler.postDelayed(this, 250L)
+                        }
+                    }
+                }
+
+                transformer = Transformer.Builder(context)
+                    .setVideoMimeType(MimeTypes.VIDEO_H264)
+                    .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                    .setAssetLoaderFactory(assetLoaderFactory)
+                    .setEncoderFactory(encoderFactory)
+                    .setMaxDelayBetweenMuxerSamplesMs(C.TIME_UNSET)
+                    .addListener(object : Transformer.Listener {
+                        override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                            finished = true
+                            activeTransformer = null
+                            mainHandler.removeCallbacks(progressPoller)
+                            onProgress(1f)
+                            if (cont.isActive) cont.resume(outputFile)
+                        }
+
+                        override fun onError(
+                            composition: Composition,
+                            exportResult: ExportResult,
+                            exportException: ExportException
+                        ) {
+                            finished = true
+                            activeTransformer = null
+                            mainHandler.removeCallbacks(progressPoller)
+                            Log.e(TAG, "Media3 export failed: ${exportException.errorCodeName}", exportException)
+                            if (cont.isActive) cont.resumeWithException(exportException)
+                        }
+                    })
+                    .build()
+
+                activeTransformer = transformer
+
+                cont.invokeOnCancellation {
+                    finished = true
+                    activeTransformer = null
+                    mainHandler.removeCallbacks(progressPoller)
+                    runCatching { transformer.cancel() }
+                }
+
+                try {
+                    transformer.start(composition, outputFile.absolutePath)
+                    mainHandler.postDelayed(progressPoller, 250L)
+                } catch (e: Exception) {
+                    finished = true
+                    activeTransformer = null
+                    mainHandler.removeCallbacks(progressPoller)
+                    if (cont.isActive) cont.resumeWithException(e)
+                }
             }
         }
+    }
+
+    private suspend fun prepareSafeInputUri(inputUri: Uri, forceStageContent: Boolean): Uri = withContext(Dispatchers.IO) {
+        if (inputUri.scheme != "content") return@withContext inputUri
+        val sizeBytes = runCatching {
+            context.contentResolver.query(inputUri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getLong(0) else -1L
+            }
+        }.getOrNull() ?: -1L
+
+        val shouldStage = forceStageContent || (sizeBytes in 1L..200_000_000L)
+        if (!shouldStage) return@withContext inputUri
+
+        val inputDir = File(context.cacheDir, "clipper/inputs").apply { mkdirs() }
+        val stagedFile = File(inputDir, "local_${inputUri.toString().hashCode().toUInt()}.mp4")
+        if (stagedFile.exists() && stagedFile.length() > 0L) {
+            return@withContext Uri.fromFile(stagedFile)
+        }
+
+        return@withContext runCatching {
+            context.contentResolver.openInputStream(inputUri)?.use { input ->
+                stagedFile.outputStream().use { output ->
+                    input.copyTo(output, bufferSize = 64 * 1024)
+                }
+            }
+            if (stagedFile.exists() && stagedFile.length() > 0L) Uri.fromFile(stagedFile) else inputUri
+        }.getOrElse { inputUri }
+    }
+
+    private suspend fun downloadRemoteToCache(remoteUri: Uri, userAgent: String): Uri? = withContext(Dispatchers.IO) {
+        val url = remoteUri.toString()
+        val inputDir = File(context.cacheDir, "clipper/inputs").apply { mkdirs() }
+        val targetFile = File(inputDir, "remote_${url.hashCode().toUInt()}.mp4")
+        if (targetFile.exists() && targetFile.length() > 100_000L) {
+            return@withContext Uri.fromFile(targetFile)
+        }
+
+        return@withContext runCatching {
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", userAgent)
+                .build()
+            downloadClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val body = resp.body ?: return@use null
+                val maxCapBytes = 250_000_000L
+                val contentLen = body.contentLength()
+                if (contentLen > maxCapBytes) return@use null
+                body.byteStream().use { input ->
+                    targetFile.outputStream().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        var total = 0L
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            total += read
+                            if (total > maxCapBytes) break
+                            output.write(buffer, 0, read)
+                        }
+                    }
+                }
+                if (targetFile.exists() && targetFile.length() > 10_000L) Uri.fromFile(targetFile) else null
+            }
+        }.getOrNull()
+    }
+
+    private fun probeDurationMs(uri: Uri, userAgent: String): Long? {
+        val scheme = uri.scheme.orEmpty().lowercase()
+        if (scheme == "http" || scheme == "https") {
+            if (".m3u8" in uri.toString().lowercase()) return null
+            val retriever = MediaMetadataRetriever()
+            return try {
+                retriever.setDataSource(uri.toString(), mapOf("User-Agent" to userAgent))
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+            } catch (_: Exception) {
+                null
+            } finally {
+                runCatching { retriever.release() }
+            }
+        }
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+        } catch (_: Exception) {
+            null
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun formatExportFailure(error: Throwable): String {
+        if (error is ExportException) {
+            val detail = error.cause?.localizedMessage ?: error.localizedMessage ?: "Unsupported or unreachable media source"
+            return "${error.errorCodeName}: $detail"
+        }
+        return error.localizedMessage ?: "Unknown codec error"
     }
 
     fun cancelExport() {

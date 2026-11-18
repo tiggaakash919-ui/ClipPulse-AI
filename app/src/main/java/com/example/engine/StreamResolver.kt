@@ -10,11 +10,14 @@ import android.util.Log
 import com.example.data.model.PlatformSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONObject
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
@@ -22,6 +25,12 @@ import kotlin.math.log10
 import kotlin.math.sqrt
 
 private const val TAG = "StreamResolver"
+
+data class TranscriptSegment(
+    val startSec: Double,
+    val endSec: Double,
+    val text: String
+)
 
 data class ResolvedStreamInfo(
     val sourceUrl: String,
@@ -31,6 +40,8 @@ data class ResolvedStreamInfo(
     val durationSec: Long,
     val isLive: Boolean,
     val directPlayableUri: String? = null,
+    val requiredUserAgent: String? = null,
+    val transcriptSegments: List<TranscriptSegment> = emptyList(),
     val heatmapMarkers: Map<Long, Double> = emptyMap(),
     val audioPeaks: List<ViralMomentEngine.AudioEnergyPoint> = emptyList(),
     val hlsSegments: List<String> = emptyList(),
@@ -42,6 +53,14 @@ private data class HlsSegmentEntry(
     val url: String,
     val durationSec: Double,
     val startOffsetSec: Double
+)
+
+private data class InnertubeProfile(
+    val clientName: String,
+    val clientVersion: String,
+    val userAgent: String,
+    val androidSdkVersion: Int? = null,
+    val deviceModel: String? = null
 )
 
 class StreamResolver(private val context: Context) {
@@ -104,14 +123,134 @@ class StreamResolver(private val context: Context) {
             PlatformSource.LOCAL_VIDEO -> resolveLocalUri(Uri.parse(trimmed))
             PlatformSource.YOUTUBE -> resolveYouTube(trimmed)
             PlatformSource.TWITCH -> resolveTwitch(trimmed)
-            PlatformSource.KICK, PlatformSource.CUSTOM_URL -> resolveGenericOrHls(trimmed, platform)
+            PlatformSource.KICK -> resolveKick(trimmed)
+            PlatformSource.CUSTOM_URL -> resolveGenericOrHls(trimmed, platform)
         }
     }
 
     private fun resolveYouTube(url: String): ResolvedStreamInfo {
         val videoId = extractYouTubeId(url)
         val normalizedUrl = if (videoId != null) "https://www.youtube.com/watch?v=$videoId" else url
-        return try {
+
+        var title = "YouTube Stream ${videoId.orEmpty()}".trim()
+        var author = "Streamer"
+        var duration = 1800L
+        var isLive = "/live" in url.lowercase()
+        var hlsUrl: String? = null
+        var progressiveMp4Url: String? = null
+        var matchedUserAgent: String? = null
+        var captionBaseUrl: String? = null
+        var heatmap: Map<Long, Double> = emptyMap()
+
+        val innertubeProfiles = listOf(
+            InnertubeProfile(
+                clientName = "ANDROID_VR",
+                clientVersion = "1.56.21",
+                userAgent = "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                androidSdkVersion = 32
+            ),
+            InnertubeProfile(
+                clientName = "IOS",
+                clientVersion = "19.29.1",
+                userAgent = "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
+                deviceModel = "iPhone16,2"
+            ),
+            InnertubeProfile(
+                clientName = "ANDROID",
+                clientVersion = "19.09.37",
+                userAgent = "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+                androidSdkVersion = 30
+            )
+        )
+
+        // 1. Try YouTube Innertube player API across Android VR / iOS / Android profiles for un-ciphered MP4/HLS & captions
+        if (videoId != null) {
+            for (profile in innertubeProfiles) {
+                runCatching {
+                    val clientObj = JSONObject().apply {
+                        put("clientName", profile.clientName)
+                        put("clientVersion", profile.clientVersion)
+                        put("hl", "en")
+                        put("gl", "US")
+                        profile.androidSdkVersion?.let { put("androidSdkVersion", it) }
+                        profile.deviceModel?.let { put("deviceModel", it) }
+                    }
+                    val payload = JSONObject().apply {
+                        put("videoId", videoId)
+                        put("context", JSONObject().apply { put("client", clientObj) })
+                    }
+                    val playerReq = Request.Builder()
+                        .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                        .header("User-Agent", profile.userAgent)
+                        .header("Content-Type", "application/json")
+                        .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                        .build()
+
+                    client.newCall(playerReq).execute().use { resp ->
+                        val body = resp.body?.string().orEmpty()
+                        if (resp.isSuccessful && body.startsWith("{")) {
+                            val root = JSONObject(body)
+                            val details = root.optJSONObject("videoDetails")
+                            if (details != null) {
+                                details.optString("title").takeIf { it.isNotBlank() }?.let { title = it }
+                                details.optString("author").takeIf { it.isNotBlank() }?.let { author = it }
+                                details.optString("lengthSeconds").toLongOrNull()?.let { if (it > 0) duration = it }
+                                if (details.optBoolean("isLiveContent", false)) {
+                                    isLive = details.optBoolean("isLive", isLive)
+                                }
+                            }
+                            if (captionBaseUrl == null) {
+                                val tracks = root.optJSONObject("captions")
+                                    ?.optJSONObject("playerCaptionsTracklistRenderer")
+                                    ?.optJSONArray("captionTracks")
+                                if (tracks != null && tracks.length() > 0) {
+                                    captionBaseUrl = tracks.optJSONObject(0)?.optString("baseUrl")
+                                        ?.takeIf { it.startsWith("http") }
+                                }
+                            }
+                            val streamingData = root.optJSONObject("streamingData")
+                            if (streamingData != null) {
+                                val foundHls = streamingData.optString("hlsManifestUrl").takeIf { it.startsWith("http") }
+                                if (hlsUrl == null && foundHls != null) {
+                                    hlsUrl = foundHls
+                                    if (matchedUserAgent == null) matchedUserAgent = profile.userAgent
+                                }
+                                val formats = streamingData.optJSONArray("formats")
+                                if (formats != null && progressiveMp4Url == null) {
+                                    var fallbackUrl: String? = null
+                                    for (i in 0 until formats.length()) {
+                                        val fmt = formats.optJSONObject(i) ?: continue
+                                        val mime = fmt.optString("mimeType")
+                                        val directUrl = fmt.optString("url").takeIf { it.startsWith("http") } ?: continue
+                                        if ("video/mp4" in mime) {
+                                            val itag = fmt.optInt("itag", 0)
+                                            if (itag == 22 || itag == 37) {
+                                                progressiveMp4Url = directUrl
+                                                matchedUserAgent = profile.userAgent
+                                                break
+                                            }
+                                            if (fallbackUrl == null || itag == 18) {
+                                                fallbackUrl = directUrl
+                                            }
+                                        }
+                                    }
+                                    if (progressiveMp4Url == null && fallbackUrl != null) {
+                                        progressiveMp4Url = fallbackUrl
+                                        matchedUserAgent = profile.userAgent
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }.onFailure {
+                    Log.w(TAG, "YouTube Innertube (${profile.clientName}) lookup skipped: ${it.message}")
+                }
+                if (progressiveMp4Url != null) break
+            }
+        }
+
+        // 2. Fetch watch HTML for Most Replayed heatmap & metadata fallback
+        runCatching {
             val req = Request.Builder()
                 .url(normalizedUrl)
                 .header("User-Agent", "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36")
@@ -119,55 +258,79 @@ class StreamResolver(private val context: Context) {
                 .build()
             client.newCall(req).execute().use { resp ->
                 val html = resp.body?.string().orEmpty()
-                val title = Regex("<meta property=\"og:title\" content=\"([^\"]+)\"")
-                    .find(html)?.groupValues?.getOrNull(1)
-                    ?: Regex("\"title\":\"([^\"]{2,150})\"").find(html)?.groupValues?.getOrNull(1)
-                    ?: "YouTube Stream ${videoId.orEmpty()}"
-                val author = Regex("\"ownerChannelName\":\"([^\"]+)\"")
-                    .find(html)?.groupValues?.getOrNull(1)
-                    ?: Regex("\"author\":\"([^\"]+)\"").find(html)?.groupValues?.getOrNull(1)
-                    ?: "Streamer"
-                val duration = Regex("\"lengthSeconds\":\"(\\d+)\"")
-                    .find(html)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 1800L
-                val isLive = html.contains("\"isLive\":true") || html.contains("\"isLiveContent\":true")
-                val hlsUrl = Regex("\"hlsManifestUrl\":\"([^\"]+)\"")
-                    .find(html)?.groupValues?.getOrNull(1)?.replace("\\u0026", "&")
-
-                val heatmap = parseYouTubeHeatmap(html)
-                val segments = if (!hlsUrl.isNullOrBlank()) parseHlsManifest(hlsUrl) else emptyList()
-                val handle = "@" + author.replace(Regex("[^A-Za-z0-9_]"), "").ifBlank { "Creator" }
-
-                ResolvedStreamInfo(
-                    sourceUrl = normalizedUrl,
-                    platform = PlatformSource.YOUTUBE,
-                    title = decodeBasicHtmlEntities(title),
-                    streamerHandle = handle,
-                    durationSec = duration.coerceAtLeast(30L),
-                    isLive = isLive,
-                    directPlayableUri = hlsUrl,
-                    heatmapMarkers = heatmap,
-                    hlsSegments = segments.map { it.url },
-                    sourceBytesEstimate = duration * 750_000L,
-                    notes = buildString {
-                        append("YouTube metadata fetched")
-                        if (heatmap.isNotEmpty()) append(" • ${heatmap.size} Most-Replayed markers")
-                        if (!hlsUrl.isNullOrBlank()) append(" • Live HLS ready")
+                if (title.startsWith("YouTube Stream")) {
+                    title = Regex("<meta property=\"og:title\" content=\"([^\"]+)\"")
+                        .find(html)?.groupValues?.getOrNull(1)
+                        ?: Regex("\"title\":\"([^\"]{2,150})\"").find(html)?.groupValues?.getOrNull(1)
+                        ?: title
+                }
+                if (author == "Streamer") {
+                    author = Regex("\"ownerChannelName\":\"([^\"]+)\"")
+                        .find(html)?.groupValues?.getOrNull(1)
+                        ?: Regex("\"author\":\"([^\"]+)\"").find(html)?.groupValues?.getOrNull(1)
+                        ?: author
+                }
+                Regex("\"lengthSeconds\":\"(\\d+)\"")
+                    .find(html)?.groupValues?.getOrNull(1)?.toLongOrNull()?.let {
+                        if (it > 0) duration = it
                     }
-                )
+                if (html.contains("\"isLive\":true")) isLive = true
+                if (hlsUrl == null) {
+                    hlsUrl = Regex("\"hlsManifestUrl\":\"([^\"]+)\"")
+                        .find(html)?.groupValues?.getOrNull(1)?.replace("\\u0026", "&")
+                }
+                heatmap = parseYouTubeHeatmap(html)
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "YouTube metadata fetch warning: ${e.message}")
-            ResolvedStreamInfo(
-                sourceUrl = normalizedUrl,
-                platform = PlatformSource.YOUTUBE,
-                title = "YouTube Video ${videoId ?: ""}".trim(),
-                streamerHandle = "@YouTubeCreator",
-                durationSec = 1800L,
-                isLive = "/live" in url.lowercase(),
-                sourceBytesEstimate = 1_350_000_000L,
-                notes = "YouTube descriptor initialized (${e.localizedMessage ?: "fallback timeline"})."
-            )
+        }.onFailure {
+            Log.w(TAG, "YouTube watch HTML fetch warning: ${it.message}")
         }
+
+        val transcript = if (!captionBaseUrl.isNullOrBlank()) fetchTimedTextTranscript(captionBaseUrl!!) else emptyList()
+        val segments = if (!hlsUrl.isNullOrBlank()) parseHlsManifest(hlsUrl!!) else emptyList()
+        val playableUri = progressiveMp4Url ?: hlsUrl
+        val handle = "@" + author.replace(Regex("[^A-Za-z0-9_]"), "").ifBlank { "Creator" }
+
+        return ResolvedStreamInfo(
+            sourceUrl = normalizedUrl,
+            platform = PlatformSource.YOUTUBE,
+            title = decodeBasicHtmlEntities(title),
+            streamerHandle = handle,
+            durationSec = duration.coerceAtLeast(30L),
+            isLive = isLive,
+            directPlayableUri = playableUri,
+            requiredUserAgent = matchedUserAgent,
+            transcriptSegments = transcript,
+            heatmapMarkers = heatmap,
+            hlsSegments = segments.map { it.url },
+            sourceBytesEstimate = duration * 750_000L,
+            notes = buildString {
+                append("YouTube metadata fetched")
+                if (heatmap.isNotEmpty()) append(" • ${heatmap.size} Most-Replayed markers")
+                if (transcript.isNotEmpty()) append(" • ${transcript.size} spoken caption lines")
+                if (progressiveMp4Url != null) append(" • Direct MP4 stream ready")
+                else if (!hlsUrl.isNullOrBlank()) append(" • HLS stream ready")
+                else append(" • Stream protected/ciphered (pick Device Video or direct .mp4/.m3u8 URL to render)")
+            }
+        )
+    }
+
+    private fun fetchTimedTextTranscript(baseUrl: String): List<TranscriptSegment> {
+        return runCatching {
+            val req = Request.Builder().url(baseUrl).build()
+            client.newCall(req).execute().use { resp ->
+                val xml = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful || xml.isBlank()) return emptyList()
+                val regex = Regex("<text start=\"([0-9.]+)\"(?: dur=\"([0-9.]+)\")?[^>]*>(.*?)</text>", RegexOption.DOT_MATCHES_ALL)
+                regex.findAll(xml).mapNotNull { match ->
+                    val start = match.groupValues[1].toDoubleOrNull() ?: return@mapNotNull null
+                    val dur = match.groupValues[2].toDoubleOrNull() ?: 3.0
+                    val rawText = decodeBasicHtmlEntities(
+                        match.groupValues[3].replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
+                    )
+                    if (rawText.isBlank()) null else TranscriptSegment(start, start + dur, rawText)
+                }.toList()
+            }
+        }.getOrDefault(emptyList())
     }
 
     private fun parseYouTubeHeatmap(html: String): Map<Long, Double> {
@@ -197,6 +360,43 @@ class StreamResolver(private val context: Context) {
             sourceBytesEstimate = if (isVod) 5_400_000_000L else 900_000_000L,
             notes = if (isVod) "Twitch VOD #$vodId timeline staged." else "Twitch IRC Rolling DVR ready."
         )
+    }
+
+    private fun resolveKick(url: String): ResolvedStreamInfo {
+        val slug = url.substringAfter("kick.com/").substringBefore("/").substringBefore("?").trim()
+        if (slug.isNotBlank() && !url.contains(".m3u8", true) && !url.contains(".mp4", true)) {
+            runCatching {
+                val req = Request.Builder()
+                    .url("https://kick.com/api/v2/channels/$slug")
+                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36")
+                    .header("Accept", "application/json")
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    val body = resp.body?.string().orEmpty()
+                    if (resp.isSuccessful && body.startsWith("{")) {
+                        val json = JSONObject(body)
+                        val playbackUrl = json.optString("playback_url").takeIf { it.startsWith("http") }
+                        val livestream = json.optJSONObject("livestream")
+                        val streamTitle = livestream?.optString("session_title")?.takeIf { it.isNotBlank() }
+                            ?: "Kick Live — @$slug"
+                        val segments = if (playbackUrl != null) parseHlsManifest(playbackUrl) else emptyList()
+                        return ResolvedStreamInfo(
+                            sourceUrl = url,
+                            platform = PlatformSource.KICK,
+                            title = streamTitle,
+                            streamerHandle = "@$slug",
+                            durationSec = 1800L,
+                            isLive = livestream != null,
+                            directPlayableUri = playbackUrl,
+                            hlsSegments = segments.map { it.url },
+                            sourceBytesEstimate = 900_000_000L,
+                            notes = if (playbackUrl != null) "Kick HLS stream resolved (${segments.size} segments)." else "Kick channel staged."
+                        )
+                    }
+                }
+            }
+        }
+        return resolveGenericOrHls(url, PlatformSource.KICK)
     }
 
     private fun resolveGenericOrHls(url: String, platform: PlatformSource): ResolvedStreamInfo {
@@ -306,26 +506,6 @@ class StreamResolver(private val context: Context) {
             if (totalBytes > 0L) return@withContext outFile to totalBytes
         }
 
-        if (sourceUrl.startsWith("http") && sourceUrl.endsWith(".mp4", ignoreCase = true)) {
-            val outFile = File(cacheDir, "${clipId}_slice.mp4")
-            val byteStart = (startSec * 450_000L).coerceAtLeast(0L)
-            val byteEnd = (endSec * 450_000L) + 1_500_000L
-            val req = Request.Builder()
-                .url(sourceUrl)
-                .header("Range", "bytes=$byteStart-$byteEnd")
-                .build()
-            runCatching {
-                client.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val bytes = resp.body?.bytes() ?: ByteArray(0)
-                        if (bytes.isNotEmpty()) {
-                            outFile.writeBytes(bytes)
-                            return@withContext outFile to bytes.size.toLong()
-                        }
-                    }
-                }
-            }
-        }
         null to 0L
     }
 

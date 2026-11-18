@@ -262,6 +262,7 @@ private fun AuthenticatedStudioShell(
     val pipelineState by viewModel.pipeline.collectAsStateWithLifecycle()
     val aiState by viewModel.aiStudio.collectAsStateWithLifecycle()
     val publishState by viewModel.publish.collectAsStateWithLifecycle()
+    val autoPilotState by viewModel.autoPilot.collectAsStateWithLifecycle()
     val clipsState by viewModel.clipsState.collectAsStateWithLifecycle()
     val campaignsState by viewModel.campaignsState.collectAsStateWithLifecycle()
     val publicationsState by viewModel.publicationsState.collectAsStateWithLifecycle()
@@ -473,11 +474,30 @@ private fun AuthenticatedStudioShell(
                                 state = analyzerState,
                                 cloudClips = cloudClips,
                                 aiState = aiState,
+                                autoPilotState = autoPilotState,
+                                captionHighlight = pipelineState.captionHighlight,
+                                youtubeAccessToken = publishState.youtubeAccessToken,
                                 onUrlChange = viewModel::updateSourceUrl,
                                 onModeChange = viewModel::updateIngestMode,
                                 onAnalyzeClick = viewModel::analyzeCurrentSource,
                                 onToggleLiveMonitor = viewModel::startOrStopLiveMonitor,
                                 onLocalVideoPicked = viewModel::onLocalVideoPicked,
+                                onUpdateAutoPilotCount = { count ->
+                                    viewModel.updateAutoPilotConfig(clipsTargetCount = count)
+                                },
+                                onToggleAutoUpload = { enabled ->
+                                    viewModel.updateAutoPilotConfig(autoUploadYouTube = enabled)
+                                },
+                                onUpdateCaptionHighlight = { hl ->
+                                    viewModel.updateCaptionHighlight(hl, selectedClip)
+                                },
+                                onSetYouTubeToken = viewModel::setYouTubeAccessToken,
+                                onRunAutoPilot = {
+                                    viewModel.runFullAutoPilot(activeCampaign)
+                                },
+                                onUploadStagedClips = {
+                                    viewModel.uploadStagedAutoPilotClips(activeCampaign)
+                                },
                                 onUpdateBucketSec = { v ->
                                     viewModel.updateDetectionConfig { it.copy(bucketSec = v) }
                                 },
@@ -503,9 +523,19 @@ private fun AuthenticatedStudioShell(
                         }
 
                         composable<StudioRoute> {
-                            val playbackUri = analyzerState.localVideoUri
-                                ?: pipelineState.downloadedSegmentFile?.let { android.net.Uri.fromFile(java.io.File(it)) }
+                            val matchingSliceUri = if (
+                                selectedClip != null &&
+                                pipelineState.downloadedSegmentClipId == selectedClip.id
+                            ) {
+                                pipelineState.downloadedSegmentFile?.let { android.net.Uri.fromFile(java.io.File(it)) }
+                            } else null
+
+                            val playbackUri = selectedClip?.localOutputPath?.let { path ->
+                                java.io.File(path).takeIf { it.exists() }?.let { android.net.Uri.fromFile(it) }
+                            }
+                                ?: analyzerState.localVideoUri
                                 ?: analyzerState.resolvedInfo?.directPlayableUri?.let { android.net.Uri.parse(it) }
+                                ?: matchingSliceUri
 
                             StudioScreen(
                                 clip = selectedClip,

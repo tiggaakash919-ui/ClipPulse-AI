@@ -127,6 +127,20 @@ data class PublishUiState(
     val activeCampaignId: String? = null
 )
 
+data class AutoPilotUiState(
+    val isRunning: Boolean = false,
+    val stepIndex: Int = 0,
+    val totalSteps: Int = 4,
+    val stepTitle: String = "Paste 1 link to Auto-Clip, Render & Upload",
+    val stepProgress: Float = 0f,
+    val clipsTargetCount: Int = 2,
+    val autoUploadYouTube: Boolean = true,
+    val renderedClips: List<ViralClip> = emptyList(),
+    val uploadedUrls: List<String> = emptyList(),
+    val needsYouTubeAuth: Boolean = false,
+    val errorMessage: String? = null
+)
+
 class ClipPulseViewModel(
     private val repository: ClipPulseRepository,
     private val currentUserId: String,
@@ -176,6 +190,9 @@ class ClipPulseViewModel(
 
     private val _publish = MutableStateFlow(PublishUiState())
     val publish: StateFlow<PublishUiState> = _publish.asStateFlow()
+
+    private val _autoPilot = MutableStateFlow(AutoPilotUiState())
+    val autoPilot: StateFlow<AutoPilotUiState> = _autoPilot.asStateFlow()
 
     private val _statusBanner = MutableStateFlow<String?>(null)
     val statusBanner: StateFlow<String?> = _statusBanner.asStateFlow()
@@ -275,7 +292,7 @@ class ClipPulseViewModel(
                     info.audioPeaks
                 }
 
-                val (buckets, detected) = ViralMomentEngine.detectMoments(
+                val rawDetected = ViralMomentEngine.detectMoments(
                     projectId = "proj_${System.currentTimeMillis()}",
                     streamerHandle = info.streamerHandle,
                     durationSec = info.durationSec,
@@ -284,10 +301,12 @@ class ClipPulseViewModel(
                     heatmapMarkers = info.heatmapMarkers,
                     audioPeaks = synthTimelinePeaks
                 )
+                val buckets = rawDetected.first
+                val detected = enrichClipTranscripts(rawDetected.second, info.transcriptSegments)
 
-                // Perform surgical byte-range / HLS segment download if stream exposes segments/MP4
+                // Stage surgical HLS .ts slice only when stream is pure HLS without progressive direct URL
                 val firstClip = detected.firstOrNull()
-                if (firstClip != null && (info.hlsSegments.isNotEmpty() || url.endsWith(".mp4", true))) {
+                if (firstClip != null && info.hlsSegments.isNotEmpty() && info.directPlayableUri?.contains(".m3u8", true) == true) {
                     val (dlFile, dlBytes) = streamResolver.downloadSurgicalWindow(
                         sourceUrl = url,
                         hlsSegments = info.hlsSegments,
@@ -300,9 +319,10 @@ class ClipPulseViewModel(
                     } else 98.5
                     _pipeline.update {
                         it.copy(
-                            sourceUri = url,
+                            sourceUri = info.directPlayableUri ?: url,
                             hlsSegmentUrls = info.hlsSegments,
                             downloadedSegmentFile = dlFile?.absolutePath,
+                            downloadedSegmentClipId = if (dlFile != null) firstClip.id else null,
                             sourceBytesEstimate = info.sourceBytesEstimate,
                             downloadedBytes = dlBytes,
                             savedPercent = savedPct
@@ -311,8 +331,10 @@ class ClipPulseViewModel(
                 } else {
                     _pipeline.update {
                         it.copy(
-                            sourceUri = url,
+                            sourceUri = info.directPlayableUri ?: url,
                             hlsSegmentUrls = info.hlsSegments,
+                            downloadedSegmentFile = null,
+                            downloadedSegmentClipId = null,
                             sourceBytesEstimate = info.sourceBytesEstimate,
                             downloadedBytes = firstClip?.let { c -> c.durationSec() * 380_000L } ?: 0L,
                             savedPercent = 98.2
@@ -329,6 +351,413 @@ class ClipPulseViewModel(
                     it.copy(isAnalyzing = false, errorMessage = e.localizedMessage ?: "Failed to resolve stream URL.")
                 }
             }
+        }
+    }
+
+    private fun enrichClipTranscripts(
+        clips: List<ViralClip>,
+        segments: List<com.example.engine.TranscriptSegment>
+    ): List<ViralClip> {
+        if (segments.isEmpty()) return clips
+        return clips.map { clip ->
+            val windowText = segments
+                .filter { seg -> seg.endSec >= clip.startSec.toDouble() && seg.startSec <= clip.endSec.toDouble() }
+                .joinToString(" ") { it.text }
+                .trim()
+            if (windowText.length >= 8) {
+                clip.copy(transcriptPreview = windowText.take(500))
+            } else {
+                clip
+            }
+        }
+    }
+
+    fun updateAutoPilotConfig(
+        clipsTargetCount: Int? = null,
+        autoUploadYouTube: Boolean? = null
+    ) {
+        _autoPilot.update {
+            it.copy(
+                clipsTargetCount = clipsTargetCount ?: it.clipsTargetCount,
+                autoUploadYouTube = autoUploadYouTube ?: it.autoUploadYouTube,
+                errorMessage = null
+            )
+        }
+    }
+
+    fun runFullAutoPilot(activeCampaign: ClippingCampaign? = null) {
+        if (_autoPilot.value.isRunning) return
+        val rawUrl = _analyzer.value.sourceUrl.trim()
+        val pickedLocal = _analyzer.value.localVideoUri
+        if (rawUrl.isBlank() && pickedLocal == null) {
+            _autoPilot.update {
+                it.copy(errorMessage = "Paste a YouTube / Kick / MP4 / .m3u8 URL or pick a Device Video first.")
+            }
+            return
+        }
+
+        val targetClipsCount = _autoPilot.value.clipsTargetCount.coerceIn(1, 5)
+        val shouldUpload = _autoPilot.value.autoUploadYouTube
+
+        viewModelScope.launch {
+            _autoPilot.update {
+                it.copy(
+                    isRunning = true,
+                    stepIndex = 1,
+                    stepProgress = 0.08f,
+                    stepTitle = "Step 1/4: Resolving stream & scanning viral peaks...",
+                    renderedClips = emptyList(),
+                    uploadedUrls = emptyList(),
+                    needsYouTubeAuth = false,
+                    errorMessage = null
+                )
+            }
+            _analyzer.update { it.copy(isAnalyzing = true, errorMessage = null) }
+
+            try {
+                val info = if (pickedLocal != null && (rawUrl.isBlank() || rawUrl == pickedLocal.toString())) {
+                    streamResolver.resolveLocalUri(pickedLocal)
+                } else if (rawUrl.startsWith("content://") || rawUrl.startsWith("file://")) {
+                    streamResolver.resolveLocalUri(Uri.parse(rawUrl))
+                } else {
+                    streamResolver.resolveUrl(rawUrl)
+                }
+
+                val cfg = _analyzer.value.config
+                val synthPeaks = if (info.heatmapMarkers.isEmpty() && info.audioPeaks.isEmpty()) {
+                    listOf(
+                        ViralMomentEngine.AudioEnergyPoint((info.durationSec * 0.22).toLong(), -9.0),
+                        ViralMomentEngine.AudioEnergyPoint((info.durationSec * 0.54).toLong(), -5.5),
+                        ViralMomentEngine.AudioEnergyPoint((info.durationSec * 0.81).toLong(), -7.0)
+                    )
+                } else info.audioPeaks
+
+                val (buckets, detectedRaw) = ViralMomentEngine.detectMoments(
+                    projectId = "auto_${System.currentTimeMillis()}",
+                    streamerHandle = info.streamerHandle,
+                    durationSec = info.durationSec,
+                    config = cfg,
+                    chatMessages = emptyList(),
+                    heatmapMarkers = info.heatmapMarkers,
+                    audioPeaks = synthPeaks
+                )
+                val detected = enrichClipTranscripts(detectedRaw, info.transcriptSegments)
+                persistAnalysisAndSelect(info, buckets, detected)
+
+                val savedClips = _analyzer.value.detectedClips.take(targetClipsCount)
+                if (savedClips.isEmpty()) {
+                    _autoPilot.update {
+                        it.copy(
+                            isRunning = false,
+                            stepProgress = 0f,
+                            errorMessage = "No viral windows detected in this source."
+                        )
+                    }
+                    return@launch
+                }
+
+                // Step 2: AI SEO & Hook Enrichment (resilient in offline mode)
+                _autoPilot.update {
+                    it.copy(
+                        stepIndex = 2,
+                        stepProgress = 0.30f,
+                        stepTitle = "Step 2/4: Generating viral titles, tags & captions..."
+                    )
+                }
+
+                val enrichedClips = savedClips.map { clip ->
+                    runCatching {
+                        val seo = geminiService.generateSearchGroundedSeo(clip, info.title)
+                        val title = seo.titleOptions.firstOrNull() ?: clip.seoTitle
+                        val updated = clip.copy(
+                            seoTitle = title,
+                            seoDescription = seo.description,
+                            seoTags = seo.tags,
+                            pinnedComment = seo.pinnedComment
+                        )
+                        if (!updated.id.startsWith("local_") && !updated.id.startsWith("dvr_")) {
+                            repository.updateClipAiAndSeo(
+                                clipId = updated.id,
+                                seoTitle = title,
+                                seoDescription = seo.description,
+                                seoTags = seo.tags,
+                                pinnedComment = seo.pinnedComment
+                            )
+                        }
+                        updated
+                    }.getOrDefault(clip)
+                }
+
+                val playableUri = pickedLocal ?: info.directPlayableUri?.let { Uri.parse(it) }
+                if (playableUri == null) {
+                    _autoPilot.update {
+                        it.copy(
+                            isRunning = false,
+                            stepIndex = 2,
+                            stepProgress = 0.5f,
+                            stepTitle = "Detected ${savedClips.size} clips — stream source is DRM/protected",
+                            errorMessage = "Platform did not return a direct MP4/HLS video stream for this link. Pick a Device Video or direct .mp4 / .m3u8 URL to auto-render & upload."
+                        )
+                    }
+                    return@launch
+                }
+
+                // Step 3: Batch 9:16 Media3 Render with Montserrat Black word-by-word captions
+                val renderedList = mutableListOf<ViralClip>()
+                val highlight = _pipeline.value.captionHighlight
+                enrichedClips.forEachIndexed { idx, clip ->
+                    val baseProgress = 0.35f + (idx.toFloat() / enrichedClips.size) * 0.45f
+                    _autoPilot.update {
+                        it.copy(
+                            stepIndex = 3,
+                            stepProgress = baseProgress,
+                            stepTitle = "Step 3/4: Rendering Clip ${idx + 1}/${enrichedClips.size} (9:16 + Pop Captions)..."
+                        )
+                    }
+                    _pipeline.update {
+                        it.copy(exportProgress = 0.05f, exportStatus = "Auto-Pilot rendering ${idx + 1}/${enrichedClips.size}...")
+                    }
+
+                    val outFile = renderClipWithFallback(
+                        primaryUri = playableUri,
+                        info = info,
+                        clip = clip,
+                        highlight = highlight
+                    ) { p ->
+                        val span = 0.45f / enrichedClips.size
+                        _autoPilot.update { ap -> ap.copy(stepProgress = baseProgress + (p * span)) }
+                        _pipeline.update { pm -> pm.copy(exportProgress = p) }
+                    }
+
+                    val renderedClip = clip.copy(
+                        localOutputPath = outFile.absolutePath,
+                        status = ClipStatus.RENDERED.name
+                    )
+                    renderedList.add(renderedClip)
+                    _analyzer.update { st ->
+                        st.copy(detectedClips = st.detectedClips.map { if (it.id == renderedClip.id) renderedClip else it })
+                    }
+                    if (!renderedClip.id.startsWith("local_") && !renderedClip.id.startsWith("dvr_")) {
+                        repository.updateClipRenderStatus(renderedClip.id, outFile.absolutePath, ClipStatus.RENDERED)
+                    }
+                }
+
+                _pipeline.update {
+                    it.copy(
+                        exportProgress = 1f,
+                        exportStatus = "Auto-Pilot rendered ${renderedList.size} 9:16 MP4 Shorts cleanly!"
+                    )
+                }
+
+                // Step 4: Automatic YouTube Shorts Upload
+                if (!shouldUpload) {
+                    _autoPilot.update {
+                        it.copy(
+                            isRunning = false,
+                            stepIndex = 4,
+                            stepProgress = 1f,
+                            stepTitle = "Auto-Pilot complete: ${renderedList.size} Shorts rendered!",
+                            renderedClips = renderedList
+                        )
+                    }
+                    _statusBanner.value = "${renderedList.size} 9:16 Shorts ready in Studio & Publish!"
+                    return@launch
+                }
+
+                val token = _publish.value.youtubeAccessToken
+                if (token.isNullOrBlank()) {
+                    _autoPilot.update {
+                        it.copy(
+                            isRunning = false,
+                            stepIndex = 4,
+                            stepProgress = 0.92f,
+                            stepTitle = "Rendered ${renderedList.size} Shorts — authorize YouTube to auto-upload!",
+                            renderedClips = renderedList,
+                            needsYouTubeAuth = true
+                        )
+                    }
+                    _statusBanner.value = "Rendered ${renderedList.size} Shorts! Tap 'Connect & Upload Now' to publish."
+                    return@launch
+                }
+
+                uploadBatchClipsToYouTube(renderedList, activeCampaign, token)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Full Auto-Pilot failed", e)
+                _analyzer.update { it.copy(isAnalyzing = false) }
+                _autoPilot.update {
+                    it.copy(
+                        isRunning = false,
+                        stepProgress = 0f,
+                        errorMessage = e.localizedMessage ?: "Auto-Pilot failed during processing."
+                    )
+                }
+            }
+        }
+    }
+
+    fun uploadStagedAutoPilotClips(activeCampaign: ClippingCampaign? = null) {
+        val token = _publish.value.youtubeAccessToken
+        val clips = _autoPilot.value.renderedClips
+        if (token.isNullOrBlank() || clips.isEmpty() || _autoPilot.value.isRunning) return
+        viewModelScope.launch {
+            _autoPilot.update {
+                it.copy(
+                    isRunning = true,
+                    needsYouTubeAuth = false,
+                    stepIndex = 4,
+                    stepProgress = 0.85f,
+                    stepTitle = "Step 4/4: Auto-uploading ${clips.size} Shorts to YouTube...",
+                    errorMessage = null
+                )
+            }
+            try {
+                uploadBatchClipsToYouTube(clips, activeCampaign, token)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Batch YouTube upload failed", e)
+                _autoPilot.update {
+                    it.copy(isRunning = false, errorMessage = e.localizedMessage ?: "YouTube upload failed.")
+                }
+            }
+        }
+    }
+
+    private suspend fun uploadBatchClipsToYouTube(
+        clips: List<ViralClip>,
+        campaign: ClippingCampaign?,
+        token: String
+    ) {
+        val uploaded = mutableListOf<String>()
+        val finalClips = mutableListOf<ViralClip>()
+        val priv = _publish.value.privacyStatus
+        val scheduled = _publish.value.scheduledIso.takeIf { it.isNotBlank() }
+
+        clips.forEachIndexed { idx, clip ->
+            val videoFile = clip.localOutputPath?.let { File(it) }
+            if (videoFile != null && videoFile.exists()) {
+                _autoPilot.update {
+                    it.copy(
+                        stepIndex = 4,
+                        stepProgress = 0.82f + (idx.toFloat() / clips.size) * 0.16f,
+                        stepTitle = "Step 4/4: Uploading Short ${idx + 1}/${clips.size} to YouTube..."
+                    )
+                }
+                val result = YouTubeUploadManager.uploadShortResumable(
+                    accessToken = token,
+                    videoFile = videoFile,
+                    title = clip.seoTitle.ifBlank { clip.title },
+                    description = clip.seoDescription.ifBlank { "${clip.hookBannerText} ${clip.creditWatermark} #shorts" },
+                    tags = clip.seoTags.ifEmpty { listOf("shorts", "viral", "clips") },
+                    privacyStatus = priv,
+                    scheduledPublishIso = scheduled,
+                    onProgress = { prog ->
+                        _publish.update { p -> p.copy(uploadProgress = prog) }
+                    }
+                )
+                uploaded.add(result.shortsUrl)
+                repository.savePublication(
+                    PublishedShort(
+                        clipId = clip.id,
+                        campaignId = campaign?.id,
+                        clipTitle = clip.seoTitle.ifBlank { clip.title },
+                        platform = PublishPlatform.YOUTUBE_SHORTS.name,
+                        privacyStatus = priv.name,
+                        youtubeVideoId = result.videoId,
+                        youtubeUrl = result.shortsUrl,
+                        scheduledPublishAt = scheduled,
+                        viewsCount = 0L,
+                        cpmRateUsd = campaign?.cpmRateUsd ?: 1.5,
+                        compliancePassed = true
+                    )
+                )
+                val pubClip = clip.copy(status = ClipStatus.PUBLISHED.name)
+                finalClips.add(pubClip)
+                _analyzer.update { st ->
+                    st.copy(detectedClips = st.detectedClips.map { if (it.id == pubClip.id) pubClip else it })
+                }
+                if (!pubClip.id.startsWith("local_") && !pubClip.id.startsWith("dvr_")) {
+                    repository.updateClipRenderStatus(pubClip.id, videoFile.absolutePath, ClipStatus.PUBLISHED)
+                }
+            } else {
+                finalClips.add(clip)
+            }
+        }
+
+        _publish.update {
+            it.copy(
+                uploadProgress = 1f,
+                uploadState = uploaded.lastOrNull()?.let { u -> AsyncOpState.Success(u) } ?: it.uploadState
+            )
+        }
+        _autoPilot.update {
+            it.copy(
+                isRunning = false,
+                stepIndex = 4,
+                stepProgress = 1f,
+                stepTitle = "Auto-Pilot Complete! Uploaded ${uploaded.size}/${clips.size} Shorts to YouTube.",
+                renderedClips = finalClips,
+                uploadedUrls = uploaded,
+                needsYouTubeAuth = false
+            )
+        }
+        _statusBanner.value = "Published ${uploaded.size} Shorts automatically to YouTube!"
+    }
+
+    private suspend fun renderClipWithFallback(
+        primaryUri: Uri,
+        info: ResolvedStreamInfo?,
+        clip: ViralClip,
+        highlight: CaptionHighlightColor,
+        onProgress: (Float) -> Unit
+    ): File {
+        val words = ViralMomentEngine.generateWordTimings(
+            clip.transcriptPreview ?: clip.hookBannerText,
+            clip.durationSec()
+        )
+        return try {
+            renderEngine.renderVerticalShort(
+                inputUri = primaryUri,
+                clip = clip,
+                captionWords = words,
+                captionHighlight = highlight,
+                isPreSlicedFile = false,
+                httpUserAgent = info?.requiredUserAgent,
+                onProgress = onProgress
+            )
+        } catch (primaryErr: Exception) {
+            val hlsSegs = info?.hlsSegments.orEmpty()
+            if (hlsSegs.isNotEmpty()) {
+                Log.w(TAG, "Direct stream render failed; downloading HLS TS slice fallback", primaryErr)
+                onProgress(0.08f)
+                val (tsFile, bytes) = streamResolver.downloadSurgicalWindow(
+                    sourceUrl = info?.sourceUrl.orEmpty(),
+                    hlsSegments = hlsSegs,
+                    startSec = clip.startSec,
+                    endSec = clip.endSec,
+                    clipId = clip.id
+                )
+                if (tsFile != null && bytes > 0L) {
+                    _pipeline.update {
+                        it.copy(
+                            downloadedSegmentFile = tsFile.absolutePath,
+                            downloadedSegmentClipId = clip.id,
+                            downloadedBytes = bytes
+                        )
+                    }
+                    return renderEngine.renderVerticalShort(
+                        inputUri = Uri.fromFile(tsFile),
+                        clip = clip,
+                        captionWords = words,
+                        captionHighlight = highlight,
+                        isPreSlicedFile = true,
+                        onProgress = onProgress
+                    )
+                }
+            }
+            throw primaryErr
         }
     }
 
@@ -566,11 +995,15 @@ class ClipPulseViewModel(
     }
 
     fun exportSelectedClipOnDevice(clip: ViralClip) {
-        val inputUri = _analyzer.value.localVideoUri
-            ?: _pipeline.value.downloadedSegmentFile?.let { Uri.fromFile(File(it)) }
-            ?: _analyzer.value.resolvedInfo?.directPlayableUri?.let { Uri.parse(it) }
+        val matchingSlice = if (_pipeline.value.downloadedSegmentClipId == clip.id) {
+            _pipeline.value.downloadedSegmentFile?.let { File(it) }?.takeIf { it.exists() && it.length() > 0L }
+        } else null
 
-        if (inputUri == null) {
+        val primaryUri = _analyzer.value.localVideoUri
+            ?: _analyzer.value.resolvedInfo?.directPlayableUri?.let { Uri.parse(it) }
+            ?: matchingSlice?.let { Uri.fromFile(it) }
+
+        if (primaryUri == null) {
             _pipeline.update {
                 it.copy(
                     exportStatus = "Error: No local video or direct MP4/HLS media stream attached. Pick a Device Video or direct MP4/HLS URL to render on-device."
@@ -579,22 +1012,35 @@ class ClipPulseViewModel(
             return
         }
 
+        val isSliceOnly = _analyzer.value.localVideoUri == null &&
+            _analyzer.value.resolvedInfo?.directPlayableUri == null &&
+            matchingSlice != null
+
         viewModelScope.launch {
             _pipeline.update { it.copy(exportProgress = 0.05f, exportStatus = "Rendering 1080x1920 via Media3...") }
             try {
-                val words = ViralMomentEngine.generateWordTimings(
-                    clip.transcriptPreview ?: clip.hookBannerText,
-                    clip.durationSec()
-                )
-                val outFile = renderEngine.renderVerticalShort(
-                    inputUri = inputUri,
-                    clip = clip,
-                    captionWords = words,
-                    captionHighlight = _pipeline.value.captionHighlight,
-                    onProgress = { p ->
-                        _pipeline.update { it.copy(exportProgress = p) }
-                    }
-                )
+                val outFile = if (isSliceOnly) {
+                    val words = ViralMomentEngine.generateWordTimings(
+                        clip.transcriptPreview ?: clip.hookBannerText,
+                        clip.durationSec()
+                    )
+                    renderEngine.renderVerticalShort(
+                        inputUri = primaryUri,
+                        clip = clip,
+                        captionWords = words,
+                        captionHighlight = _pipeline.value.captionHighlight,
+                        isPreSlicedFile = true,
+                        onProgress = { p -> _pipeline.update { it.copy(exportProgress = p) } }
+                    )
+                } else {
+                    renderClipWithFallback(
+                        primaryUri = primaryUri,
+                        info = _analyzer.value.resolvedInfo,
+                        clip = clip,
+                        highlight = _pipeline.value.captionHighlight,
+                        onProgress = { p -> _pipeline.update { it.copy(exportProgress = p) } }
+                    )
+                }
                 val updated = clip.copy(
                     localOutputPath = outFile.absolutePath,
                     status = ClipStatus.RENDERED.name

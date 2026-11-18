@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -30,13 +31,17 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.LiveTv
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.RadioButtonChecked
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.Button
@@ -45,6 +50,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -63,13 +69,16 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.data.model.CaptionHighlightColor
 import com.example.data.model.IngestMode
 import com.example.data.model.ViralClip
 import com.example.engine.ViralMomentEngine
+import com.example.engine.YouTubeUploadManager
 import com.example.ui.components.SpikeGraphCard
 import com.example.ui.theme.BroadcastSlate
 import com.example.ui.theme.CrimsonLive
@@ -86,6 +95,9 @@ import com.example.ui.theme.TextSecondary
 import com.example.ui.viewmodel.AiStudioUiState
 import com.example.ui.viewmodel.AnalyzerUiState
 import com.example.ui.viewmodel.AsyncOpState
+import com.example.ui.viewmodel.AutoPilotUiState
+import com.google.android.gms.auth.api.identity.Identity
+import java.io.File
 import kotlin.math.abs
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -94,11 +106,20 @@ fun AnalyzeScreen(
     state: AnalyzerUiState,
     cloudClips: List<ViralClip>,
     aiState: AiStudioUiState,
+    autoPilotState: AutoPilotUiState,
+    captionHighlight: CaptionHighlightColor,
+    youtubeAccessToken: String?,
     onUrlChange: (String) -> Unit,
     onModeChange: (IngestMode) -> Unit,
     onAnalyzeClick: () -> Unit,
     onToggleLiveMonitor: () -> Unit,
     onLocalVideoPicked: (Uri) -> Unit,
+    onUpdateAutoPilotCount: (Int) -> Unit,
+    onToggleAutoUpload: (Boolean) -> Unit,
+    onUpdateCaptionHighlight: (CaptionHighlightColor) -> Unit,
+    onSetYouTubeToken: (String?) -> Unit,
+    onRunAutoPilot: () -> Unit,
+    onUploadStagedClips: () -> Unit,
     onUpdateBucketSec: (Int) -> Unit,
     onUpdateBeforeSec: (Int) -> Unit,
     onUpdateAfterSec: (Int) -> Unit,
@@ -108,7 +129,50 @@ fun AnalyzeScreen(
     onOpenClipInStudio: (ViralClip) -> Unit,
     onRunDeepRetentionAudit: (ViralClip) -> Unit
 ) {
+    val context = LocalContext.current
     var showParams by remember { mutableStateOf(false) }
+    var autoUploadAfterOAuth by remember { mutableStateOf(false) }
+    var oauthInlineError by remember { mutableStateOf<String?>(null) }
+
+    val authClient = remember(context) { Identity.getAuthorizationClient(context) }
+    val oauthLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        runCatching {
+            val authResult = authClient.getAuthorizationResultFromIntent(result.data)
+            onSetYouTubeToken(authResult.accessToken)
+            oauthInlineError = null
+            if (autoUploadAfterOAuth) {
+                autoUploadAfterOAuth = false
+                onUploadStagedClips()
+            }
+        }.onFailure { err ->
+            autoUploadAfterOAuth = false
+            oauthInlineError = err.localizedMessage ?: "YouTube OAuth authorization cancelled."
+        }
+    }
+
+    fun launchYouTubeOAuth(uploadImmediatelyWhenAuthorized: Boolean) {
+        autoUploadAfterOAuth = uploadImmediatelyWhenAuthorized
+        oauthInlineError = null
+        authClient.authorize(YouTubeUploadManager.buildAuthorizationRequest())
+            .addOnSuccessListener { result ->
+                val pending = result.pendingIntent
+                if (result.hasResolution() && pending != null) {
+                    oauthLauncher.launch(IntentSenderRequest.Builder(pending.intentSender).build())
+                } else {
+                    onSetYouTubeToken(result.accessToken)
+                    if (uploadImmediatelyWhenAuthorized) {
+                        autoUploadAfterOAuth = false
+                        onUploadStagedClips()
+                    }
+                }
+            }
+            .addOnFailureListener { err ->
+                autoUploadAfterOAuth = false
+                oauthInlineError = err.localizedMessage ?: "YouTube OAuth failed."
+            }
+    }
 
     val videoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -435,6 +499,253 @@ fun AnalyzeScreen(
                                 color = NeonMint,
                                 style = MaterialTheme.typography.bodyMedium
                             )
+                        }
+                    }
+                }
+            }
+
+            // 1-Link Full Auto-Pilot Pipeline Card
+            item {
+                Surface(
+                    color = ElevatedCard,
+                    shape = RoundedCornerShape(20.dp),
+                    border = BorderStroke(1.5.dp, ElectricVolt.copy(alpha = 0.65f))
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "1-Link Full Auto-Pilot",
+                                    style = MaterialTheme.typography.titleLarge,
+                                    color = ElectricVolt
+                                )
+                                Text(
+                                    text = "Paste 1 link -> Auto-Detect -> Pop Captions -> 9:16 Render -> YouTube Upload",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = TextSecondary
+                                )
+                            }
+                            ScoreBadge(
+                                text = if (youtubeAccessToken != null) "YT Ready ✓" else "Auto Mode",
+                                accent = if (youtubeAccessToken != null) NeonMint else CyberCyan
+                            )
+                        }
+
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(1, 2, 3).forEach { count ->
+                                FilterChip(
+                                    selected = autoPilotState.clipsTargetCount == count,
+                                    onClick = { onUpdateAutoPilotCount(count) },
+                                    label = { Text("$count ${if (count == 1) "Clip" else "Clips"}") },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = ElectricVolt,
+                                        selectedLabelColor = ObsidianInk
+                                    ),
+                                    modifier = Modifier.testTag("autopilot_count_$count")
+                                )
+                            }
+                            CaptionHighlightColor.entries.forEach { hl ->
+                                FilterChip(
+                                    selected = captionHighlight == hl,
+                                    onClick = { onUpdateCaptionHighlight(hl) },
+                                    label = {
+                                        Text(
+                                            if (hl == CaptionHighlightColor.VIBRANT_YELLOW) "Yellow Pop" else "Neon Green"
+                                        )
+                                    },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(hl.argbHex),
+                                        selectedLabelColor = ObsidianInk
+                                    ),
+                                    modifier = Modifier.testTag("autopilot_caption_${hl.name.lowercase()}")
+                                )
+                            }
+                            FilterChip(
+                                selected = autoPilotState.autoUploadYouTube,
+                                onClick = { onToggleAutoUpload(!autoPilotState.autoUploadYouTube) },
+                                label = { Text("Auto-Upload YT Shorts") },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.CloudUpload,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = CrimsonLive,
+                                    selectedLabelColor = TextPrimary,
+                                    selectedLeadingIconColor = TextPrimary
+                                ),
+                                modifier = Modifier.testTag("autopilot_upload_toggle")
+                            )
+                        }
+
+                        if (autoPilotState.autoUploadYouTube && youtubeAccessToken == null) {
+                            OutlinedButton(
+                                onClick = { launchYouTubeOAuth(uploadImmediatelyWhenAuthorized = false) },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp)
+                                    .testTag("autopilot_youtube_oauth_button")
+                            ) {
+                                Icon(Icons.Default.CloudUpload, contentDescription = null, tint = CyberCyan)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Connect YouTube Channel (OAuth 2.0)", color = CyberCyan)
+                            }
+                        }
+
+                        if (!oauthInlineError.isNullOrBlank()) {
+                            Text(
+                                text = oauthInlineError.orEmpty(),
+                                color = CrimsonLive,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+
+                        Button(
+                            onClick = onRunAutoPilot,
+                            enabled = !autoPilotState.isRunning && !state.isAnalyzing,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = ElectricVolt,
+                                contentColor = ObsidianInk
+                            ),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp)
+                                .testTag("autopilot_run_button")
+                        ) {
+                            if (autoPilotState.isRunning) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    color = ObsidianInk,
+                                    strokeWidth = 2.dp
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text("Auto-Pilot Running (${(autoPilotState.stepProgress * 100).toInt()}%)...")
+                            } else {
+                                Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = if (autoPilotState.autoUploadYouTube) {
+                                        "Auto-Clip, Render & Upload"
+                                    } else {
+                                        "Auto-Clip & Render 9:16"
+                                    }
+                                )
+                            }
+                        }
+
+                        if (autoPilotState.isRunning || autoPilotState.stepProgress > 0f) {
+                            LinearProgressIndicator(
+                                progress = { autoPilotState.stepProgress },
+                                modifier = Modifier.fillMaxWidth(),
+                                color = ElectricVolt,
+                                trackColor = SteelOutline
+                            )
+                            Text(
+                                text = autoPilotState.stepTitle,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = if (autoPilotState.uploadedUrls.isNotEmpty()) NeonMint else CyberCyan
+                            )
+                        }
+
+                        if (!autoPilotState.errorMessage.isNullOrBlank()) {
+                            Text(
+                                text = autoPilotState.errorMessage,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = CrimsonLive
+                            )
+                        }
+
+                        if (autoPilotState.needsYouTubeAuth && autoPilotState.renderedClips.isNotEmpty()) {
+                            Button(
+                                onClick = { launchYouTubeOAuth(uploadImmediatelyWhenAuthorized = true) },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = CrimsonLive,
+                                    contentColor = TextPrimary
+                                ),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp)
+                                    .testTag("autopilot_connect_and_upload_button")
+                            ) {
+                                Icon(Icons.Default.CloudUpload, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("Authorize YouTube & Auto-Upload ${autoPilotState.renderedClips.size} Clips Now")
+                            }
+                        }
+
+                        if (autoPilotState.renderedClips.isNotEmpty()) {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(
+                                    text = "Auto-Pilot Output (${autoPilotState.renderedClips.size} MP4 Ready)",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = NeonMint
+                                )
+                                autoPilotState.renderedClips.forEachIndexed { idx, rClip ->
+                                    val uploadedUrl = autoPilotState.uploadedUrls.getOrNull(idx)
+                                    Surface(
+                                        color = BroadcastSlate,
+                                        shape = RoundedCornerShape(12.dp),
+                                        border = BorderStroke(1.dp, if (uploadedUrl != null) NeonMint.copy(alpha = 0.6f) else SteelOutline)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = rClip.seoTitle.ifBlank { rClip.title },
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    color = TextPrimary,
+                                                    maxLines = 1
+                                                )
+                                                Text(
+                                                    text = uploadedUrl ?: "Rendered 9:16 MP4 (${rClip.durationSec()}s)",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = if (uploadedUrl != null) NeonMint else CyberCyan,
+                                                    maxLines = 1
+                                                )
+                                            }
+                                            Spacer(Modifier.width(8.dp))
+                                            OutlinedButton(
+                                                onClick = {
+                                                    val f = rClip.localOutputPath?.let { File(it) }
+                                                    YouTubeUploadManager.shareClipWithSeoCaption(
+                                                        context = context,
+                                                        videoFile = f,
+                                                        seoTitle = rClip.seoTitle.ifBlank { rClip.title },
+                                                        seoDescription = rClip.seoDescription
+                                                    )
+                                                },
+                                                modifier = Modifier
+                                                    .height(48.dp)
+                                                    .testTag("autopilot_share_${rClip.id}")
+                                            ) {
+                                                Icon(Icons.Default.Share, contentDescription = "Share clip", modifier = Modifier.size(16.dp))
+                                                Spacer(Modifier.width(4.dp))
+                                                Text("Share")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

@@ -303,6 +303,7 @@ data class PipelineMetrics(
     val sourceUri: String = "",
     val hlsSegmentUrls: List<String> = emptyList(),
     val downloadedSegmentFile: String? = null,
+    val downloadedSegmentClipId: String? = null,
     val sourceBytesEstimate: Long = 0L,
     val downloadedBytes: Long = 0L,
     val savedPercent: Double = 0.0,
