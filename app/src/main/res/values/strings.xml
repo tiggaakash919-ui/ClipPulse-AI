@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">ClipPulse AI</string>
+    <string name="tagline">Viral Stream Clipper &amp; Shorts Auto-Publisher</string>
+    <string name="sign_in_with_google">Sign in with Google</string>
+    <string name="sign_out">Sign out</string>
+    <string name="nav_analyze">Analyze</string>
+    <string name="nav_studio">Studio</string>
+    <string name="nav_publish">Publish</string>
+    <string name="nav_campaigns">Campaigns</string>
+    <string name="nav_inspector">Inspector</string>
+    <string name="mode_vod">VOD Mode</string>
+    <string name="mode_live">Live Monitor</string>
+    <string name="action_analyze_stream">Analyze Moments</string>
+    <string name="action_pick_video">Pick Device Video</string>
+    <string name="action_export_clip">Export 9:16 MP4</string>
+    <string name="action_publish_youtube">Upload to YouTube Shorts</string>
+    <string name="action_share_multi">Multi-Platform Share</string>
+    <string name="action_open_coach">Viral Coach</string>
+    <string name="error_generic">Something went wrong. Please retry.</string>
+</resources>

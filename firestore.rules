@@ -1,0 +1,235 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: Default-deny everything not explicitly matched
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidProject(data, userId) {
+      return data.userId is string && data.userId == userId &&
+        data.sourceUrl is string && data.sourceUrl.size() >= 1 && data.sourceUrl.size() <= 1000 &&
+        data.platform in ['YOUTUBE', 'TWITCH', 'KICK', 'CUSTOM_URL', 'LOCAL_VIDEO'] &&
+        data.ingestMode in ['VOD', 'LIVE_DVR'] &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+        data.streamerHandle is string && data.streamerHandle.size() >= 1 && data.streamerHandle.size() <= 80 &&
+        data.durationSec is int && data.durationSec >= 0 && data.durationSec <= 86400 &&
+        data.bucketSec is int && data.bucketSec >= 5 && data.bucketSec <= 30 &&
+        data.beforeSec is int && data.beforeSec >= 5 && data.beforeSec <= 60 &&
+        data.afterSec is int && data.afterSec >= 5 && data.afterSec <= 60 &&
+        data.gapSec is int && data.gapSec >= 10 && data.gapSec <= 300 &&
+        data.topCount is int && data.topCount >= 1 && data.topCount <= 20 &&
+        data.peakMultiplier is number && data.peakMultiplier >= 0.0 && data.peakMultiplier <= 100.0 &&
+        (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000));
+    }
+
+    function isValidClip(data, userId) {
+      return data.userId is string && data.userId == userId &&
+        data.projectId is string && data.projectId.size() >= 1 && data.projectId.size() <= 128 &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+        data.streamerHandle is string && data.streamerHandle.size() >= 1 && data.streamerHandle.size() <= 80 &&
+        data.startSec is int && data.startSec >= 0 &&
+        data.endSec is int && data.endSec > data.startSec &&
+        data.spikeMultiplier is number && data.spikeMultiplier >= 0.0 && data.spikeMultiplier <= 100.0 &&
+        data.viralScore is int && data.viralScore >= 0 && data.viralScore <= 100 &&
+        data.layoutPreset in ['WORD_POP', 'SPLIT_SCREEN', 'CINEMA_BLUR', 'FULL_CROP'] &&
+        data.hookBannerText is string && data.hookBannerText.size() <= 80 &&
+        data.hookBannerStyle in ['VOLT_PILL', 'WHITE_PILL', 'CRIMSON_ALERT'] &&
+        data.creditWatermark is string && data.creditWatermark.size() <= 80 &&
+        data.chatOverlayEnabled is bool &&
+        data.seoTitle is string && data.seoTitle.size() <= 100 &&
+        data.seoDescription is string && data.seoDescription.size() <= 2500 &&
+        data.seoTags is list && data.seoTags.size() <= 30 &&
+        (data.seoTags.size() == 0 || data.seoTags[0] is string) &&
+        data.pinnedComment is string && data.pinnedComment.size() <= 500 &&
+        (!('localOutputPath' in data) || (data.localOutputPath is string && data.localOutputPath.size() <= 500)) &&
+        (!('aiRetentionSummary' in data) || (data.aiRetentionSummary is string && data.aiRetentionSummary.size() <= 2000)) &&
+        (!('transcriptPreview' in data) || (data.transcriptPreview is string && data.transcriptPreview.size() <= 3000)) &&
+        (!('status' in data) || data.status in ['DETECTED', 'RENDERED', 'PUBLISHED']);
+    }
+
+    function isValidCampaign(data, userId) {
+      return data.userId is string && data.userId == userId &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 100 &&
+        data.creatorHandle is string && data.creatorHandle.size() >= 1 && data.creatorHandle.size() <= 80 &&
+        data.requiredMention is string && data.requiredMention.size() <= 80 &&
+        data.requiredHashtags is list && data.requiredHashtags.size() <= 15 &&
+        (data.requiredHashtags.size() == 0 || data.requiredHashtags[0] is string) &&
+        data.minDurationSec is int && data.minDurationSec >= 3 && data.minDurationSec <= 180 &&
+        data.maxDurationSec is int && data.maxDurationSec >= data.minDurationSec && data.maxDurationSec <= 300 &&
+        data.watermarkCorner in ['TOP_LEFT', 'TOP_RIGHT', 'BOTTOM_LEFT', 'BOTTOM_RIGHT'] &&
+        data.cpmRateUsd is number && data.cpmRateUsd >= 0.0 && data.cpmRateUsd <= 1000.0 &&
+        data.active is bool &&
+        (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000));
+    }
+
+    function isValidPublication(data, userId) {
+      return data.userId is string && data.userId == userId &&
+        data.clipId is string && data.clipId.size() >= 1 && data.clipId.size() <= 128 &&
+        data.clipTitle is string && data.clipTitle.size() >= 1 && data.clipTitle.size() <= 120 &&
+        data.platform in ['YOUTUBE_SHORTS', 'TIKTOK', 'INSTAGRAM_REELS'] &&
+        data.privacyStatus in ['PUBLIC', 'UNLISTED', 'PRIVATE_SCHEDULED'] &&
+        data.youtubeVideoId is string && data.youtubeVideoId.size() <= 64 &&
+        data.youtubeUrl is string && data.youtubeUrl.size() <= 300 &&
+        data.viewsCount is int && data.viewsCount >= 0 &&
+        data.cpmRateUsd is number && data.cpmRateUsd >= 0.0 && data.cpmRateUsd <= 1000.0 &&
+        data.compliancePassed is bool &&
+        (!('campaignId' in data) || (data.campaignId is string && data.campaignId.size() <= 128)) &&
+        (!('scheduledPublishAt' in data) || (data.scheduledPublishAt is string && data.scheduledPublishAt.size() <= 64));
+    }
+
+    match /users/{userId} {
+      allow read, write: if false;
+
+      match /projects/{projectId} {
+        allow list: if isOwner(userId);
+        allow get, delete: if isOwner(userId) && isValidId(projectId);
+        allow create: if isOwner(userId) &&
+          isValidId(projectId) &&
+          incoming().keys().hasAll([
+            'userId', 'sourceUrl', 'platform', 'ingestMode', 'title', 'streamerHandle',
+            'durationSec', 'bucketSec', 'beforeSec', 'afterSec', 'gapSec', 'topCount',
+            'peakMultiplier', 'createdAt', 'updatedAt'
+          ]) &&
+          incoming().keys().hasOnly([
+            'userId', 'sourceUrl', 'platform', 'ingestMode', 'title', 'streamerHandle',
+            'durationSec', 'bucketSec', 'beforeSec', 'afterSec', 'gapSec', 'topCount',
+            'peakMultiplier', 'notes', 'createdAt', 'updatedAt'
+          ]) &&
+          incoming().createdAt is timestamp && incoming().createdAt <= request.time &&
+          incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+          isValidProject(incoming(), userId);
+        allow update: if isOwner(userId) &&
+          isValidId(projectId) &&
+          isValidProject(incoming(), userId) &&
+          incoming().userId == existing().userId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title', 'streamerHandle', 'ingestMode', 'bucketSec', 'beforeSec',
+            'afterSec', 'gapSec', 'topCount', 'peakMultiplier', 'notes', 'updatedAt'
+          ]);
+      }
+
+      match /clips/{clipId} {
+        allow list: if isOwner(userId);
+        allow get, delete: if isOwner(userId) && isValidId(clipId);
+        allow create: if isOwner(userId) &&
+          isValidId(clipId) &&
+          incoming().keys().hasAll([
+            'userId', 'projectId', 'title', 'streamerHandle', 'startSec', 'endSec',
+            'spikeMultiplier', 'viralScore', 'layoutPreset', 'hookBannerText',
+            'hookBannerStyle', 'creditWatermark', 'chatOverlayEnabled', 'seoTitle',
+            'seoDescription', 'seoTags', 'pinnedComment', 'createdAt', 'updatedAt'
+          ]) &&
+          incoming().keys().hasOnly([
+            'userId', 'projectId', 'title', 'streamerHandle', 'startSec', 'endSec',
+            'spikeMultiplier', 'viralScore', 'layoutPreset', 'hookBannerText',
+            'hookBannerStyle', 'creditWatermark', 'chatOverlayEnabled', 'seoTitle',
+            'seoDescription', 'seoTags', 'pinnedComment', 'localOutputPath',
+            'aiRetentionSummary', 'transcriptPreview', 'status', 'createdAt', 'updatedAt'
+          ]) &&
+          incoming().createdAt is timestamp && incoming().createdAt <= request.time &&
+          incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+          isValidClip(incoming(), userId);
+        allow update: if isOwner(userId) &&
+          isValidId(clipId) &&
+          isValidClip(incoming(), userId) &&
+          incoming().userId == existing().userId &&
+          incoming().projectId == existing().projectId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title', 'streamerHandle', 'startSec', 'endSec', 'viralScore', 'layoutPreset',
+            'hookBannerText', 'hookBannerStyle', 'creditWatermark', 'chatOverlayEnabled',
+            'seoTitle', 'seoDescription', 'seoTags', 'pinnedComment', 'localOutputPath',
+            'aiRetentionSummary', 'transcriptPreview', 'status', 'updatedAt'
+          ]);
+      }
+
+      match /campaigns/{campaignId} {
+        allow list: if isOwner(userId);
+        allow get, delete: if isOwner(userId) && isValidId(campaignId);
+        allow create: if isOwner(userId) &&
+          isValidId(campaignId) &&
+          incoming().keys().hasAll([
+            'userId', 'name', 'creatorHandle', 'requiredMention', 'requiredHashtags',
+            'minDurationSec', 'maxDurationSec', 'watermarkCorner', 'cpmRateUsd',
+            'active', 'createdAt', 'updatedAt'
+          ]) &&
+          incoming().keys().hasOnly([
+            'userId', 'name', 'creatorHandle', 'requiredMention', 'requiredHashtags',
+            'minDurationSec', 'maxDurationSec', 'watermarkCorner', 'cpmRateUsd',
+            'active', 'notes', 'createdAt', 'updatedAt'
+          ]) &&
+          incoming().createdAt is timestamp && incoming().createdAt <= request.time &&
+          incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+          isValidCampaign(incoming(), userId);
+        allow update: if isOwner(userId) &&
+          isValidId(campaignId) &&
+          isValidCampaign(incoming(), userId) &&
+          incoming().userId == existing().userId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'creatorHandle', 'requiredMention', 'requiredHashtags',
+            'minDurationSec', 'maxDurationSec', 'watermarkCorner', 'cpmRateUsd',
+            'active', 'notes', 'updatedAt'
+          ]);
+      }
+
+      match /publications/{publicationId} {
+        allow list: if isOwner(userId);
+        allow get, delete: if isOwner(userId) && isValidId(publicationId);
+        allow create: if isOwner(userId) &&
+          isValidId(publicationId) &&
+          incoming().keys().hasAll([
+            'userId', 'clipId', 'clipTitle', 'platform', 'privacyStatus',
+            'youtubeVideoId', 'youtubeUrl', 'viewsCount', 'cpmRateUsd',
+            'compliancePassed', 'createdAt', 'updatedAt'
+          ]) &&
+          incoming().keys().hasOnly([
+            'userId', 'clipId', 'campaignId', 'clipTitle', 'platform', 'privacyStatus',
+            'youtubeVideoId', 'youtubeUrl', 'scheduledPublishAt', 'viewsCount',
+            'cpmRateUsd', 'compliancePassed', 'createdAt', 'updatedAt'
+          ]) &&
+          incoming().createdAt is timestamp && incoming().createdAt <= request.time &&
+          incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+          isValidPublication(incoming(), userId);
+        allow update: if isOwner(userId) &&
+          isValidId(publicationId) &&
+          isValidPublication(incoming(), userId) &&
+          incoming().userId == existing().userId &&
+          incoming().clipId == existing().clipId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt is timestamp && incoming().updatedAt <= request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'viewsCount', 'privacyStatus', 'youtubeVideoId', 'youtubeUrl',
+            'scheduledPublishAt', 'updatedAt'
+          ]);
+      }
+    }
+  }
+}

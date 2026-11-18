@@ -1,0 +1,137 @@
+{
+  "entities": {
+    "ClipProject": {
+      "title": "ClipProject",
+      "description": "Source video or live stream analysis project with detection tuning parameters.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Authenticated owner UID" },
+        "sourceUrl": { "type": "string", "description": "Source VOD, live stream URL, or local content identifier" },
+        "platform": { "type": "string", "enum": ["YOUTUBE", "TWITCH", "KICK", "CUSTOM_URL", "LOCAL_VIDEO"] },
+        "ingestMode": { "type": "string", "enum": ["VOD", "LIVE_DVR"] },
+        "title": { "type": "string", "description": "Stream or video title" },
+        "streamerHandle": { "type": "string", "description": "Creator handle for attribution" },
+        "durationSec": { "type": "integer" },
+        "bucketSec": { "type": "integer" },
+        "beforeSec": { "type": "integer" },
+        "afterSec": { "type": "integer" },
+        "gapSec": { "type": "integer" },
+        "topCount": { "type": "integer" },
+        "peakMultiplier": { "type": "number" },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Server timestamp via FieldValue.serverTimestamp()" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Server timestamp via FieldValue.serverTimestamp()" }
+      },
+      "required": [
+        "userId", "sourceUrl", "platform", "ingestMode", "title", "streamerHandle",
+        "durationSec", "bucketSec", "beforeSec", "afterSec", "gapSec", "topCount",
+        "peakMultiplier", "createdAt", "updatedAt"
+      ]
+    },
+    "ViralClip": {
+      "title": "ViralClip",
+      "description": "Detected or edited 9:16 vertical clip with caption, hook banner, and SEO metadata.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "projectId": { "type": "string" },
+        "title": { "type": "string" },
+        "streamerHandle": { "type": "string" },
+        "startSec": { "type": "integer" },
+        "endSec": { "type": "integer" },
+        "spikeMultiplier": { "type": "number" },
+        "viralScore": { "type": "integer" },
+        "layoutPreset": { "type": "string", "enum": ["WORD_POP", "SPLIT_SCREEN", "CINEMA_BLUR", "FULL_CROP"] },
+        "hookBannerText": { "type": "string" },
+        "hookBannerStyle": { "type": "string", "enum": ["VOLT_PILL", "WHITE_PILL", "CRIMSON_ALERT"] },
+        "creditWatermark": { "type": "string" },
+        "chatOverlayEnabled": { "type": "boolean" },
+        "seoTitle": { "type": "string" },
+        "seoDescription": { "type": "string" },
+        "seoTags": { "type": "array" },
+        "pinnedComment": { "type": "string" },
+        "localOutputPath": { "type": "string" },
+        "aiRetentionSummary": { "type": "string" },
+        "transcriptPreview": { "type": "string" },
+        "status": { "type": "string", "enum": ["DETECTED", "RENDERED", "PUBLISHED"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId", "projectId", "title", "streamerHandle", "startSec", "endSec",
+        "spikeMultiplier", "viralScore", "layoutPreset", "hookBannerText", "hookBannerStyle",
+        "creditWatermark", "chatOverlayEnabled", "seoTitle", "seoDescription", "seoTags",
+        "pinnedComment", "createdAt", "updatedAt"
+      ]
+    },
+    "ClippingCampaign": {
+      "title": "ClippingCampaign",
+      "description": "Creator or Whop clipping campaign compliance rules and CPM payout rate.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "creatorHandle": { "type": "string" },
+        "requiredMention": { "type": "string" },
+        "requiredHashtags": { "type": "array" },
+        "minDurationSec": { "type": "integer" },
+        "maxDurationSec": { "type": "integer" },
+        "watermarkCorner": { "type": "string", "enum": ["TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"] },
+        "cpmRateUsd": { "type": "number" },
+        "active": { "type": "boolean" },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId", "name", "creatorHandle", "requiredMention", "requiredHashtags",
+        "minDurationSec", "maxDurationSec", "watermarkCorner", "cpmRateUsd", "active",
+        "createdAt", "updatedAt"
+      ]
+    },
+    "PublishedShort": {
+      "title": "PublishedShort",
+      "description": "Tracked published YouTube Short or cross-posted video with views and earnings.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "clipId": { "type": "string" },
+        "campaignId": { "type": "string" },
+        "clipTitle": { "type": "string" },
+        "platform": { "type": "string", "enum": ["YOUTUBE_SHORTS", "TIKTOK", "INSTAGRAM_REELS"] },
+        "privacyStatus": { "type": "string", "enum": ["PUBLIC", "UNLISTED", "PRIVATE_SCHEDULED"] },
+        "youtubeVideoId": { "type": "string" },
+        "youtubeUrl": { "type": "string" },
+        "scheduledPublishAt": { "type": "string" },
+        "viewsCount": { "type": "integer" },
+        "cpmRateUsd": { "type": "number" },
+        "compliancePassed": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId", "clipId", "clipTitle", "platform", "privacyStatus",
+        "youtubeVideoId", "youtubeUrl", "viewsCount", "cpmRateUsd",
+        "compliancePassed", "createdAt", "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/projects/{projectId}": {
+      "schema": { "$ref": "#/entities/ClipProject" },
+      "description": "User-owned source analysis projects"
+    },
+    "/users/{userId}/clips/{clipId}": {
+      "schema": { "$ref": "#/entities/ViralClip" },
+      "description": "User-owned detected and edited 9:16 clips"
+    },
+    "/users/{userId}/campaigns/{campaignId}": {
+      "schema": { "$ref": "#/entities/ClippingCampaign" },
+      "description": "User-owned clipping campaign rules and CPM rates"
+    },
+    "/users/{userId}/publications/{publicationId}": {
+      "schema": { "$ref": "#/entities/PublishedShort" },
+      "description": "User-owned published Shorts tracking and earnings"
+    }
+  }
+}

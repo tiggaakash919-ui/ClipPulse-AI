@@ -1,0 +1,6 @@
+{
+  "name": "ClipPulse AI",
+  "description": "On-device viral stream clipper and YouTube Shorts auto-publisher with multi-model Gemini intelligence and campaign tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
