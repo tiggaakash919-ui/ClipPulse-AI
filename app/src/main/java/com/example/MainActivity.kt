@@ -108,6 +108,7 @@ import com.example.ui.theme.TextSecondary
 import com.example.ui.viewmodel.ClipPulseViewModel
 import com.example.ui.viewmodel.DataUiState
 import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.auth
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.serialization.Serializable
@@ -172,6 +173,15 @@ private fun AppNavigation(
     sharedUrlFlow: MutableStateFlow<String?>,
     onConsumeSharedUrl: () -> Unit
 ) {
+    val context = LocalContext.current
+    val firebaseReady = remember(context) {
+        FirebaseApp.getApps(context).isNotEmpty() || FirebaseApp.initializeApp(context) != null
+    }
+    if (!firebaseReady) {
+        AuthScreen(onAuthSuccess = {})
+        return
+    }
+
     val currentUser by Firebase.auth.authStateFlow()
         .collectAsStateWithLifecycle(initialValue = Firebase.auth.currentUser)
 
