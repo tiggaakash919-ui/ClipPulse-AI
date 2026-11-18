@@ -137,6 +137,7 @@ fun StudioScreen(
         transcript: String?
     ) -> Unit,
     onUpdateCaptionHighlight: (CaptionHighlightColor) -> Unit,
+    onAttachLocalVideo: (Uri) -> Unit,
     onExportClip: (ViralClip) -> Unit,
     onGoToPublish: () -> Unit,
     onGenerateFastHooks: (ViralClip) -> Unit,
@@ -219,6 +220,12 @@ fun StudioScreen(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) onStartMicRecording()
+    }
+
+    val studioLocalVideoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) onAttachLocalVideo(uri)
     }
 
     val captionWords = remember(transcriptDraft, clip.hookBannerText, clip.startSec, clip.endSec) {
@@ -492,6 +499,20 @@ fun StudioScreen(
                             color = if (pipeline.exportStatus.contains("fail", true) || pipeline.exportStatus.contains("Error")) CrimsonLive else NeonMint,
                             style = MaterialTheme.typography.labelMedium
                         )
+                    }
+                    if (effectivePlaybackUri == null) {
+                        OutlinedButton(
+                            onClick = {
+                                studioLocalVideoPicker.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
+                                )
+                            },
+                            modifier = Modifier.fillMaxWidth().height(48.dp).testTag("studio_attach_video_button")
+                        ) {
+                            Icon(Icons.Default.VideoFile, contentDescription = null, tint = ElectricVolt)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Attach Device Video for 9:16 Render", color = ElectricVolt)
+                        }
                     }
                 }
             }

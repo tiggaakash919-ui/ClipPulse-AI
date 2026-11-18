@@ -33,6 +33,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -57,6 +58,7 @@ import androidx.credentials.CredentialManager
 import com.example.R
 import com.example.auth.attemptAutoSignIn
 import com.example.auth.onGoogleSignInClicked
+import com.example.ui.theme.AmberWarn
 import com.example.ui.theme.BroadcastSlate
 import com.example.ui.theme.CrimsonLive
 import com.example.ui.theme.CyberCyan
@@ -69,6 +71,8 @@ import com.example.ui.theme.TextSecondary
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun AuthScreen(
+    firebaseReady: Boolean = true,
+    onContinueOffline: () -> Unit = {},
     onAuthSuccess: () -> Unit
 ) {
     val context = LocalContext.current
@@ -78,14 +82,16 @@ fun AuthScreen(
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(Unit) {
-        attemptAutoSignIn(
-            context = context,
-            credentialManager = credentialManager,
-            onAuthSuccess = onAuthSuccess,
-            onUnauthenticated = { },
-            scope = scope
-        )
+    LaunchedEffect(firebaseReady) {
+        if (firebaseReady) {
+            attemptAutoSignIn(
+                context = context,
+                credentialManager = credentialManager,
+                onAuthSuccess = onAuthSuccess,
+                onUnauthenticated = { },
+                scope = scope
+            )
+        }
     }
 
     Box(
@@ -202,58 +208,90 @@ fun AuthScreen(
                         }
                     }
 
-                    Button(
-                        onClick = {
-                            errorMessage = null
-                            isLoading = true
-                            onGoogleSignInClicked(
-                                context = context,
-                                credentialManager = credentialManager,
-                                onAuthSuccess = {
-                                    isLoading = false
-                                    onAuthSuccess()
-                                },
-                                onAuthError = { msg ->
-                                    isLoading = false
-                                    errorMessage = msg
-                                },
-                                scope = scope,
-                                onAuthCancelled = {
-                                    isLoading = false
+                    if (!firebaseReady) {
+                        Surface(
+                            color = AmberWarn.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(12.dp),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, AmberWarn.copy(alpha = 0.45f))
+                        ) {
+                            Text(
+                                text = "GitHub APK On-Device Mode: Firebase google-services.json was not bundled in this build. You can still use the full 4-layer clipper, Montserrat Black word-by-word ASS captions, 9:16 Media3 renderer, and Share Sheet locally right now!",
+                                color = AmberWarn,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.padding(12.dp)
+                            )
+                        }
+
+                        Button(
+                            onClick = onContinueOffline,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = ElectricVolt,
+                                contentColor = StudioObsidian
+                            ),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(54.dp)
+                                .testTag("offline_studio_button")
+                        ) {
+                            Icon(Icons.Default.MovieCreation, contentDescription = null, modifier = Modifier.size(20.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Text("Open On-Device Clip Studio", style = MaterialTheme.typography.labelLarge)
+                        }
+                    } else {
+                        Button(
+                            onClick = {
+                                errorMessage = null
+                                isLoading = true
+                                onGoogleSignInClicked(
+                                    context = context,
+                                    credentialManager = credentialManager,
+                                    onAuthSuccess = {
+                                        isLoading = false
+                                        onAuthSuccess()
+                                    },
+                                    onAuthError = { msg ->
+                                        isLoading = false
+                                        errorMessage = msg
+                                    },
+                                    scope = scope,
+                                    onAuthCancelled = {
+                                        isLoading = false
+                                    }
+                                )
+                            },
+                            enabled = !isLoading,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = ElectricVolt,
+                                contentColor = StudioObsidian
+                            ),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(54.dp)
+                                .testTag("google_sign_in_button")
+                        ) {
+                            if (isLoading) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(22.dp),
+                                    color = StudioObsidian,
+                                    strokeWidth = 2.5.dp
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Text("Connecting Studio...", style = MaterialTheme.typography.labelLarge)
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .clip(CircleShape)
+                                        .background(StudioObsidian),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("G", color = ElectricVolt, fontWeight = FontWeight.Bold)
                                 }
-                            )
-                        },
-                        enabled = !isLoading,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = ElectricVolt,
-                            contentColor = StudioObsidian
-                        ),
-                        shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(54.dp)
-                            .testTag("google_sign_in_button")
-                    ) {
-                        if (isLoading) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(22.dp),
-                                color = StudioObsidian,
-                                strokeWidth = 2.5.dp
-                            )
-                            Spacer(Modifier.width(10.dp))
-                            Text("Connecting Studio...", style = MaterialTheme.typography.labelLarge)
-                        } else {
-                            Box(
-                                modifier = Modifier
-                                    .size(24.dp)
-                                    .clip(CircleShape)
-                                    .background(StudioObsidian),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text("G", color = ElectricVolt, fontWeight = FontWeight.Bold)
+                                Spacer(Modifier.width(10.dp))
+                                Text("Sign in with Google", style = MaterialTheme.typography.labelLarge)
                             }
-                            Spacer(Modifier.width(10.dp))
-                            Text("Sign in with Google", style = MaterialTheme.typography.labelLarge)
                         }
                     }
                 }

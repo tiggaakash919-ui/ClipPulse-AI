@@ -527,6 +527,13 @@ class ClipPulseViewModel(
         activeClip?.let { syncSelectedClipDerivedState(it) }
     }
 
+    fun ensureSelectedClipSynced(clip: ViralClip?) {
+        if (clip == null) return
+        if (_pipeline.value.assSubtitleScript.isBlank() || _publish.value.customTitle.isBlank()) {
+            syncSelectedClipDerivedState(clip)
+        }
+    }
+
     private fun syncSelectedClipDerivedState(clip: ViralClip) {
         val words = ViralMomentEngine.generateWordTimings(
             clip.transcriptPreview ?: clip.hookBannerText,

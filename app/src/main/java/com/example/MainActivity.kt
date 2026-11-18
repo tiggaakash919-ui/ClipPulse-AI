@@ -175,10 +175,30 @@ private fun AppNavigation(
 ) {
     val context = LocalContext.current
     val firebaseReady = remember(context) {
-        FirebaseApp.getApps(context).isNotEmpty() || FirebaseApp.initializeApp(context) != null
+        FirebaseApp.getApps(context).isNotEmpty() ||
+            runCatching { FirebaseApp.initializeApp(context) != null }.getOrDefault(false)
     }
+    var offlineStudioMode by remember { mutableStateOf(!firebaseReady) }
+
     if (!firebaseReady) {
-        AuthScreen(onAuthSuccess = {})
+        if (!offlineStudioMode) {
+            AuthScreen(
+                firebaseReady = false,
+                onContinueOffline = { offlineStudioMode = true },
+                onAuthSuccess = {}
+            )
+            return
+        }
+        key("offline_studio") {
+            AuthenticatedStudioShell(
+                uid = "local_studio",
+                userLabel = "On-Device Studio",
+                isOfflineMode = true,
+                onExitOfflineMode = { offlineStudioMode = false },
+                sharedUrlFlow = sharedUrlFlow,
+                onConsumeSharedUrl = onConsumeSharedUrl
+            )
+        }
         return
     }
 
@@ -187,7 +207,11 @@ private fun AppNavigation(
 
     val user = currentUser
     if (user == null) {
-        AuthScreen(onAuthSuccess = {})
+        AuthScreen(
+            firebaseReady = true,
+            onContinueOffline = {},
+            onAuthSuccess = {}
+        )
         return
     }
 
@@ -195,6 +219,8 @@ private fun AppNavigation(
         AuthenticatedStudioShell(
             uid = user.uid,
             userLabel = user.displayName ?: user.email ?: "Creator",
+            isOfflineMode = false,
+            onExitOfflineMode = {},
             sharedUrlFlow = sharedUrlFlow,
             onConsumeSharedUrl = onConsumeSharedUrl
         )
@@ -206,6 +232,8 @@ private fun AppNavigation(
 private fun AuthenticatedStudioShell(
     uid: String,
     userLabel: String,
+    isOfflineMode: Boolean,
+    onExitOfflineMode: () -> Unit,
     sharedUrlFlow: MutableStateFlow<String?>,
     onConsumeSharedUrl: () -> Unit
 ) {
@@ -219,7 +247,7 @@ private fun AuthenticatedStudioShell(
         factory = viewModelFactory {
             initializer {
                 ClipPulseViewModel(
-                    repository = ClipPulseRepository(appContext),
+                    repository = ClipPulseRepository.create(appContext),
                     currentUserId = uid,
                     streamResolver = StreamResolver(appContext),
                     renderEngine = Media3RenderEngine(appContext),
@@ -271,6 +299,10 @@ private fun AuthenticatedStudioShell(
             onConsumeSharedUrl()
             navigateTo(AnalyzeRoute)
         }
+    }
+
+    LaunchedEffect(selectedClip?.id) {
+        viewModel.ensureSelectedClipSynced(selectedClip)
     }
 
     LaunchedEffect(statusBanner) {
@@ -347,7 +379,13 @@ private fun AuthenticatedStudioShell(
                         }
                         Spacer(Modifier.width(4.dp))
                         IconButton(
-                            onClick = { signOut(credentialManager, scope) },
+                            onClick = {
+                                if (isOfflineMode) {
+                                    onExitOfflineMode()
+                                } else {
+                                    signOut(credentialManager, scope)
+                                }
+                            },
                             modifier = Modifier
                                 .size(48.dp)
                                 .testTag("sign_out_button")
@@ -488,6 +526,7 @@ private fun AuthenticatedStudioShell(
                                 onUpdateCaptionHighlight = { color ->
                                     viewModel.updateCaptionHighlight(color, selectedClip)
                                 },
+                                onAttachLocalVideo = viewModel::onLocalVideoPicked,
                                 onExportClip = viewModel::exportSelectedClipOnDevice,
                                 onGoToPublish = { navigateTo(PublishRoute) },
                                 onGenerateFastHooks = viewModel::generateFastHooks,

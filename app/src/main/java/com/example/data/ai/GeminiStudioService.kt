@@ -10,6 +10,7 @@ import com.example.data.model.ImageSizeOption
 import com.example.data.model.SeoBundle
 import com.example.data.model.ViralClip
 import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.AspectRatio
 import com.google.firebase.ai.type.Content
@@ -145,8 +146,18 @@ class GeminiStudioService {
         )
     }
 
+    private fun requireFirebaseInitialized() {
+        val ready = runCatching { FirebaseApp.getInstance() }.isSuccess
+        if (!ready) {
+            throw IllegalStateException(
+                "Cloud Gemini AI requires google-services.json (add GOOGLE_SERVICES_JSON secret on GitHub). On-device clipping, 9:16 Media3 rendering, and .ASS captions work offline."
+            )
+        }
+    }
+
     suspend fun generateFastHooks(clip: ViralClip): List<String> {
         return try {
+            requireFirebaseInitialized()
             val prompt = """
                 Generate 4 punchy 1st-second viral Shorts hook banners (max 28 chars, bold curiosity/action, optional 1 emoji) for:
                 Streamer: ${clip.streamerHandle}
@@ -170,6 +181,7 @@ class GeminiStudioService {
 
     suspend fun generateSearchGroundedSeo(clip: ViralClip, topicHint: String): SeoBundle {
         return try {
+            requireFirebaseInitialized()
             val prompt = """
                 Use Google Search to check current trending gaming/streaming Shorts hashtags and phrasing for:
                 Creator: ${clip.streamerHandle}
@@ -217,6 +229,7 @@ class GeminiStudioService {
 
     suspend fun runDeepRetentionAudit(clip: ViralClip): RetentionAuditResult {
         return try {
+            requireFirebaseInitialized()
             val prompt = """
                 Deeply evaluate this ${clip.durationSec()}s vertical Short candidate for YouTube Shorts retention:
                 Streamer: ${clip.streamerHandle}
@@ -248,6 +261,7 @@ class GeminiStudioService {
 
     suspend fun analyzeVideoClip(videoBytes: ByteArray, contextPrompt: String): String {
         return try {
+            requireFirebaseInitialized()
             require(videoBytes.size <= 19 * 1024 * 1024) {
                 "Video clip exceeds 19MB inline limit. Trim clip window to <= 45s."
             }
@@ -275,6 +289,7 @@ class GeminiStudioService {
 
     suspend fun analyzeThumbnailOrFrame(bitmap: Bitmap): String {
         return try {
+            requireFirebaseInitialized()
             val response = withTimeout(60_000L) {
                 multimodalArgonModel.generateContent(
                     content {
@@ -299,6 +314,7 @@ class GeminiStudioService {
 
     suspend fun transcribeMicrophoneAudio(wavBytes: ByteArray): String {
         return try {
+            requireFirebaseInitialized()
             val response = withTimeout(60_000L) {
                 transcribeModel.generateContent(
                     content {
@@ -324,6 +340,7 @@ class GeminiStudioService {
         sizeOption: ImageSizeOption
     ): Bitmap {
         return try {
+            requireFirebaseInitialized()
             val mappedRatio = when (aspectOption) {
                 ImageAspectOption.RATIO_1_1 -> AspectRatio.SQUARE_1x1
                 ImageAspectOption.RATIO_2_3 -> AspectRatio.PORTRAIT_2x3
@@ -371,6 +388,7 @@ class GeminiStudioService {
         userPrompt: String,
         mode: CoachMode
     ): Flow<Pair<String, List<String>>> = flow {
+        requireFirebaseInitialized()
         val model = when (mode) {
             CoachMode.FAST -> fastCoachModel
             CoachMode.GROUNDED -> groundedCoachModel
