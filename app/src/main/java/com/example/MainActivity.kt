@@ -475,6 +475,9 @@ private fun AuthenticatedStudioShell(
                                         transcript = transcript
                                     )
                                 },
+                                onUpdateCaptionHighlight = { color ->
+                                    viewModel.updateCaptionHighlight(color, selectedClip)
+                                },
                                 onExportClip = viewModel::exportSelectedClipOnDevice,
                                 onGoToPublish = { navigateTo(PublishRoute) },
                                 onGenerateFastHooks = viewModel::generateFastHooks,

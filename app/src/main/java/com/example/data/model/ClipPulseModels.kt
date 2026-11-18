@@ -290,6 +290,15 @@ data class DetectionConfig(
     val topCount: Int = 5
 )
 
+enum class CaptionHighlightColor(
+    val label: String,
+    val argbHex: Int,
+    val assBgrColor: String
+) {
+    VIBRANT_YELLOW("Vibrant Yellow", 0xFFFFE600.toInt(), "&H0000E6FF&"),
+    NEON_GREEN("Neon Green", 0xFF39FF14.toInt(), "&H0014FF39&")
+}
+
 data class PipelineMetrics(
     val sourceUri: String = "",
     val hlsSegmentUrls: List<String> = emptyList(),
@@ -301,7 +310,9 @@ data class PipelineMetrics(
     val exportStatus: String = "Idle",
     val ffmpegExtractCommand: String = "",
     val ffmpegRenderCommand: String = "",
-    val assSubtitleScript: String = ""
+    val assSubtitleScript: String = "",
+    val captionHighlight: CaptionHighlightColor = CaptionHighlightColor.VIBRANT_YELLOW,
+    val exportedAssPath: String? = null
 )
 
 data class ComplianceCheckItem(

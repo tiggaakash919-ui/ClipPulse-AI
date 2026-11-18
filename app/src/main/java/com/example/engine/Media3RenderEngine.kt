@@ -8,10 +8,12 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.OptIn
+import androidx.core.content.res.ResourcesCompat
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
@@ -28,6 +30,8 @@ import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
+import com.example.R
+import com.example.data.model.CaptionHighlightColor
 import com.example.data.model.CaptionWord
 import com.example.data.model.HookBannerStyle
 import com.example.data.model.LayoutPreset
@@ -52,6 +56,7 @@ class Media3RenderEngine(private val context: Context) {
         inputUri: Uri,
         clip: ViralClip,
         captionWords: List<CaptionWord>,
+        captionHighlight: CaptionHighlightColor = CaptionHighlightColor.VIBRANT_YELLOW,
         onProgress: (Float) -> Unit
     ): File = withContext(Dispatchers.Main) {
         val outputDir = File(context.cacheDir, "clipper/clips").apply { mkdirs() }
@@ -84,8 +89,10 @@ class Media3RenderEngine(private val context: Context) {
         )
 
         val dynamicOverlay = ShortsDynamicBitmapOverlay(
+            context = context,
             clip = clip,
-            words = captionWords
+            words = captionWords,
+            captionHighlight = captionHighlight
         )
         val overlayEffect = OverlayEffect(ImmutableList.of<TextureOverlay>(dynamicOverlay))
 
@@ -172,8 +179,10 @@ class Media3RenderEngine(private val context: Context) {
 
 @OptIn(UnstableApi::class)
 private class ShortsDynamicBitmapOverlay(
+    context: Context,
     private val clip: ViralClip,
-    private val words: List<CaptionWord>
+    private val words: List<CaptionWord>,
+    private val captionHighlight: CaptionHighlightColor
 ) : BitmapOverlay() {
 
     private val width = 1080
@@ -181,9 +190,19 @@ private class ShortsDynamicBitmapOverlay(
     private val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     private val canvas = Canvas(bitmap)
 
+    private val montserratBlackTypeface: Typeface = run {
+        val base = runCatching { ResourcesCompat.getFont(context, R.font.montserrat) }.getOrNull()
+            ?: Typeface.SANS_SERIF
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            Typeface.create(base, 900, false)
+        } else {
+            Typeface.create(base, Typeface.BOLD)
+        }
+    }
+
     private val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val hookTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        typeface = Typeface.create(Typeface.DEFAULT_BOLD, Typeface.BOLD)
+        typeface = montserratBlackTypeface
         textSize = 52f
         textAlign = Paint.Align.CENTER
     }
@@ -195,18 +214,20 @@ private class ShortsDynamicBitmapOverlay(
     }
     private val captionStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 12f
+        strokeWidth = 16f
         strokeJoin = Paint.Join.ROUND
+        strokeCap = Paint.Cap.ROUND
         color = Color.BLACK
-        textSize = 72f
-        typeface = Typeface.create(Typeface.DEFAULT_BOLD, Typeface.BOLD)
-        textAlign = Paint.Align.CENTER
+        textSize = 76f
+        typeface = montserratBlackTypeface
+        textAlign = Paint.Align.LEFT
+        setShadowLayer(12f, 0f, 6f, Color.argb(225, 0, 0, 0))
     }
     private val captionFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        textSize = 72f
-        typeface = Typeface.create(Typeface.DEFAULT_BOLD, Typeface.BOLD)
-        textAlign = Paint.Align.CENTER
+        textSize = 76f
+        typeface = montserratBlackTypeface
+        textAlign = Paint.Align.LEFT
     }
     private val chatBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.argb(150, 12, 16, 26)
@@ -253,7 +274,7 @@ private class ShortsDynamicBitmapOverlay(
             canvas.drawText("CHAT: ${clip.spikeMultiplier}x SPIKE 🔥", 64f, 1240f, chatTextPaint)
         }
 
-        // 4. Word-by-Word Hormozi Yellow Pop Captions at safe lower-third
+        // 4. Word-by-Word Montserrat Black Pop Captions in lower-third (y = 1530 matches MarginV=390)
         val activeIdx = words.indexOfFirst { timeMs in it.startMs..it.endMs }
         if (activeIdx >= 0) {
             val windowStart = (activeIdx / 3) * 3
@@ -261,23 +282,44 @@ private class ShortsDynamicBitmapOverlay(
             val group = words.subList(windowStart, windowEnd)
             val activeInGroup = activeIdx - windowStart
             val fullLine = group.joinToString(" ") { it.word.uppercase() }
-            val y = 1520f
-
-            canvas.drawText(fullLine, width / 2f, y, captionStrokePaint)
+            val y = 1530f
 
             val totalWidth = captionFillPaint.measureText(fullLine)
             var cursorX = (width - totalWidth) / 2f
             val spaceW = captionFillPaint.measureText(" ")
-            captionFillPaint.textAlign = Paint.Align.LEFT
+
             group.forEachIndexed { idx, w ->
                 val txt = w.word.uppercase()
-                captionFillPaint.color = if (idx == activeInGroup) Color.parseColor("#FFE600") else Color.WHITE
-                captionFillPaint.textSize = if (idx == activeInGroup) 80f else 72f
+                val tokenWidth = captionFillPaint.measureText(txt)
+                val isActive = idx == activeInGroup
+
+                val scale = if (isActive) {
+                    val wordDur = (w.endMs - w.startMs).coerceAtLeast(120L)
+                    val elapsed = (timeMs - w.startMs).coerceAtLeast(0L)
+                    val popInMs = minOf(65L, wordDur / 3L).coerceAtLeast(1L)
+                    val popSettleMs = minOf(170L, (wordDur * 2L) / 3L).coerceAtLeast(popInMs + 1L)
+                    when {
+                        elapsed <= popInMs -> 1.0f + 0.18f * (elapsed.toFloat() / popInMs.toFloat())
+                        elapsed <= popSettleMs -> {
+                            val settleProgress = (elapsed - popInMs).toFloat() / (popSettleMs - popInMs).toFloat()
+                            1.18f - 0.14f * settleProgress
+                        }
+                        else -> 1.04f
+                    }
+                } else {
+                    1.0f
+                }
+
+                val centerX = cursorX + tokenWidth / 2f
+                canvas.save()
+                canvas.scale(scale, scale, centerX, y - 24f)
+                canvas.drawText(txt, cursorX, y, captionStrokePaint)
+                captionFillPaint.color = if (isActive) captionHighlight.argbHex else Color.WHITE
                 canvas.drawText(txt, cursorX, y, captionFillPaint)
-                cursorX += captionFillPaint.measureText(txt) + spaceW
+                canvas.restore()
+
+                cursorX += tokenWidth + spaceW
             }
-            captionFillPaint.textAlign = Paint.Align.CENTER
-            captionFillPaint.textSize = 72f
         }
 
         return bitmap

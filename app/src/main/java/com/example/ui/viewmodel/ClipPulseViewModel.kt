@@ -9,6 +9,7 @@ import com.example.data.ai.GeminiStudioService
 import com.example.data.ai.RetentionAuditResult
 import com.example.data.firebase.ClipPulseRepository
 import com.example.data.model.AiChatMessage
+import com.example.data.model.CaptionHighlightColor
 import com.example.data.model.CaptionWord
 import com.example.data.model.ClipProject
 import com.example.data.model.ClipStatus
@@ -521,12 +522,18 @@ class ClipPulseViewModel(
         }
     }
 
+    fun updateCaptionHighlight(color: CaptionHighlightColor, activeClip: ViralClip?) {
+        _pipeline.update { it.copy(captionHighlight = color) }
+        activeClip?.let { syncSelectedClipDerivedState(it) }
+    }
+
     private fun syncSelectedClipDerivedState(clip: ViralClip) {
         val words = ViralMomentEngine.generateWordTimings(
             clip.transcriptPreview ?: clip.hookBannerText,
             clip.durationSec()
         )
-        val ass = FfmpegCommandBuilder.buildAssScript(clip, words)
+        val highlight = _pipeline.value.captionHighlight
+        val ass = FfmpegCommandBuilder.buildAssScript(clip, words, highlight)
         val srcUri = _analyzer.value.localVideoUri?.toString()
             ?: _pipeline.value.downloadedSegmentFile
             ?: _analyzer.value.sourceUrl.ifBlank { "input_stream.mp4" }
@@ -576,6 +583,7 @@ class ClipPulseViewModel(
                     inputUri = inputUri,
                     clip = clip,
                     captionWords = words,
+                    captionHighlight = _pipeline.value.captionHighlight,
                     onProgress = { p ->
                         _pipeline.update { it.copy(exportProgress = p) }
                     }

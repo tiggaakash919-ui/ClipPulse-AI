@@ -8,6 +8,9 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -31,6 +34,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
@@ -65,11 +69,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -79,6 +89,7 @@ import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import com.example.data.model.CaptionHighlightColor
 import com.example.data.model.HookBannerStyle
 import com.example.data.model.ImageAspectOption
 import com.example.data.model.ImageModelOption
@@ -125,6 +136,7 @@ fun StudioScreen(
         chatOverlayEnabled: Boolean?,
         transcript: String?
     ) -> Unit,
+    onUpdateCaptionHighlight: (CaptionHighlightColor) -> Unit,
     onExportClip: (ViralClip) -> Unit,
     onGoToPublish: () -> Unit,
     onGenerateFastHooks: (ViralClip) -> Unit,
@@ -371,20 +383,56 @@ fun StudioScreen(
                             val chunkStart = (previewWordIndex / 3) * 3
                             val chunk = captionWords.subList(chunkStart, minOf(chunkStart + 3, captionWords.size))
                             val activeInChunk = previewWordIndex - chunkStart
+                            val highlightComposeColor = Color(pipeline.captionHighlight.argbHex)
                             Row(
                                 modifier = Modifier
                                     .align(Alignment.BottomCenter)
                                     .padding(bottom = 52.dp, start = 12.dp, end = 12.dp),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
                                 chunk.forEachIndexed { idx, w ->
-                                    Text(
-                                        text = w.word.uppercase(),
-                                        fontFamily = MontserratFont,
-                                        fontWeight = FontWeight.ExtraBold,
-                                        fontSize = if (idx == activeInChunk) 18.sp else 16.sp,
-                                        color = if (idx == activeInChunk) ElectricVolt else Color.White
+                                    val isActive = idx == activeInChunk
+                                    val popScale by animateFloatAsState(
+                                        targetValue = if (isActive) 1.18f else 1.0f,
+                                        animationSpec = spring(
+                                            dampingRatio = Spring.DampingRatioMediumBouncy,
+                                            stiffness = Spring.StiffnessHigh
+                                        ),
+                                        label = "word_pop_scale"
                                     )
+                                    val wordText = w.word.uppercase()
+                                    val baseStyle = TextStyle(
+                                        fontFamily = MontserratFont,
+                                        fontWeight = FontWeight.Black,
+                                        fontSize = 16.sp,
+                                        letterSpacing = 0.5.sp
+                                    )
+                                    Box(
+                                        modifier = Modifier.graphicsLayer {
+                                            scaleX = popScale
+                                            scaleY = popScale
+                                        }
+                                    ) {
+                                        Text(
+                                            text = wordText,
+                                            style = baseStyle.copy(
+                                                color = Color.Black,
+                                                drawStyle = Stroke(width = 9f, join = StrokeJoin.Round),
+                                                shadow = Shadow(
+                                                    color = Color.Black,
+                                                    offset = Offset(0f, 4f),
+                                                    blurRadius = 6f
+                                                )
+                                            )
+                                        )
+                                        Text(
+                                            text = wordText,
+                                            style = baseStyle.copy(
+                                                color = if (isActive) highlightComposeColor else Color.White
+                                            )
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -559,6 +607,40 @@ fun StudioScreen(
                                 },
                                 modifier = Modifier.testTag("chat_overlay_switch")
                             )
+                        }
+
+                        Text(
+                            text = "Word-by-Word ASS Highlight (Montserrat Black • Lower-Third)",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = TextSecondary
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            CaptionHighlightColor.entries.forEach { option ->
+                                val selected = pipeline.captionHighlight == option
+                                val swatch = Color(option.argbHex)
+                                FilterChip(
+                                    selected = selected,
+                                    onClick = { onUpdateCaptionHighlight(option) },
+                                    leadingIcon = {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(12.dp)
+                                                .clip(CircleShape)
+                                                .background(swatch)
+                                                .border(1.dp, Color.Black, CircleShape)
+                                        )
+                                    },
+                                    label = { Text(option.label) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = swatch.copy(alpha = 0.20f),
+                                        selectedLabelColor = swatch
+                                    ),
+                                    modifier = Modifier.testTag("caption_color_${option.name.lowercase()}")
+                                )
+                            }
                         }
 
                         OutlinedTextField(

@@ -3,23 +3,26 @@ package com.example.ui.screens
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
@@ -34,9 +37,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import com.example.data.model.PipelineMetrics
 import com.example.data.model.ViralClip
 import com.example.engine.FfmpegCommandBuilder
@@ -62,11 +67,36 @@ fun InspectorScreen(
         copiedBanner = "Copied $label to clipboard"
     }
 
+    fun shareAssFile(assContent: String) {
+        runCatching {
+            val file = FfmpegCommandBuilder.writeAssScriptFile(
+                context = context,
+                clipId = clip?.id ?: "clippulse",
+                assScript = assContent
+            )
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file
+            )
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "${file.name} (ClipPulse ASS Subtitles)")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(shareIntent, "Export .ASS Subtitles"))
+            copiedBanner = "Saved ${file.name} to cache"
+        }.onFailure {
+            copiedBanner = "Could not export .ass file: ${it.localizedMessage}"
+        }
+    }
+
     val extractCmd = pipeline.ffmpegExtractCommand.ifBlank {
         "ffmpeg -y -ss 00:07:00 -to 00:07:35 -i \"stream.m3u8\" -c copy \"cache/clip_raw.mp4\""
     }
     val renderCmd = pipeline.ffmpegRenderCommand.ifBlank {
-        "ffmpeg -y -i \"cache/clip_raw.mp4\" -filter_complex \"[0:v]crop=ih*9/16:ih:(iw-ow)/2:0,scale=1080:1920,ass='captions.ass'[v]\" -map \"[v]\" -map 0:a? -r 30 -c:v libx264 -crf 20 -preset veryfast -c:a aac -b:a 192k \"cache/short_9x16.mp4\""
+        "ffmpeg -y -i \"cache/clip_raw.mp4\" -filter_complex \"[0:v]crop=ih*9/16:ih:(iw-ow)/2:0,scale=1080:1920,ass='captions.ass':fontsdir='fonts'[v]\" -map \"[v]\" -map \"0:a?\" -c:v libx264 -crf 20 -preset veryfast -r 30 -c:a aac -b:a 192k \"cache/short_9x16.mp4\""
     }
     val audioCmd = FfmpegCommandBuilder.buildAudioStatsCommand("cache/clip_raw.mp4")
 
@@ -101,6 +131,26 @@ fun InspectorScreen(
                         Text("Active Preset", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Text(clip?.layoutPresetEnum()?.label ?: "Word-by-Word Pop", style = MaterialTheme.typography.labelMedium)
                     }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("ASS Caption Highlight", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(pipeline.captionHighlight.argbHex))
+                            )
+                            Text(
+                                text = "Montserrat Black • ${pipeline.captionHighlight.label}",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = Color(pipeline.captionHighlight.argbHex)
+                            )
+                        }
+                    }
                     if (copiedBanner != null) {
                         Text(copiedBanner.orEmpty(), style = MaterialTheme.typography.labelSmall, color = NeonMint)
                     }
@@ -128,7 +178,7 @@ fun InspectorScreen(
 
         item {
             CodeBlockCard(
-                title = "3. 9:16 RENDER FILTERGRAPH (1080x1920 H.264)",
+                title = "3. 9:16 RENDER FILTERGRAPH (FFmpeg ass= Filter)",
                 code = renderCmd,
                 testTag = "copy_render_cmd",
                 onCopy = { copyText("Render Filtergraph", renderCmd) }
@@ -137,13 +187,18 @@ fun InspectorScreen(
 
         item {
             val ass = pipeline.assSubtitleScript.ifBlank {
-                "Select a clip in Analyze or Studio to inspect its generated .ass Hormozi subtitle script."
+                "Select a clip in Analyze or Studio to inspect its generated .ass Montserrat Black word-by-word subtitle script."
             }
             CodeBlockCard(
                 title = "4. GENERATED .ASS WORD-BY-WORD SUBTITLES",
                 code = ass,
                 testTag = "copy_ass_script",
-                onCopy = { copyText(".ASS Subtitles", ass) }
+                onCopy = { copyText(".ASS Subtitles", ass) },
+                extraActionLabel = if (pipeline.assSubtitleScript.isNotBlank()) "Share .ass" else null,
+                extraActionTag = "share_ass_button",
+                onExtraAction = if (pipeline.assSubtitleScript.isNotBlank()) {
+                    { shareAssFile(ass) }
+                } else null
             )
         }
     }
@@ -154,7 +209,10 @@ private fun CodeBlockCard(
     title: String,
     code: String,
     testTag: String,
-    onCopy: () -> Unit
+    onCopy: () -> Unit,
+    extraActionLabel: String? = null,
+    extraActionTag: String? = null,
+    onExtraAction: (() -> Unit)? = null
 ) {
     Card(
         colors = CardDefaults.cardColors(containerColor = BroadcastSlate),
@@ -170,14 +228,27 @@ private fun CodeBlockCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(title, style = MaterialTheme.typography.labelMedium, color = ElectricVolt, modifier = Modifier.weight(1f))
-                OutlinedButton(
-                    onClick = onCopy,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                    modifier = Modifier.testTag(testTag)
-                ) {
-                    Icon(Icons.Default.ContentCopy, contentDescription = "Copy $title", modifier = Modifier.size(14.dp), tint = CyberCyan)
-                    Spacer(Modifier.width(4.dp))
-                    Text("Copy", style = MaterialTheme.typography.labelSmall, color = CyberCyan)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (extraActionLabel != null && onExtraAction != null && extraActionTag != null) {
+                        OutlinedButton(
+                            onClick = onExtraAction,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier.testTag(extraActionTag)
+                        ) {
+                            Icon(Icons.Default.Share, contentDescription = extraActionLabel, modifier = Modifier.size(14.dp), tint = ElectricVolt)
+                            Spacer(Modifier.width(4.dp))
+                            Text(extraActionLabel, style = MaterialTheme.typography.labelSmall, color = ElectricVolt)
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = onCopy,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier.testTag(testTag)
+                    ) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = "Copy $title", modifier = Modifier.size(14.dp), tint = CyberCyan)
+                        Spacer(Modifier.width(4.dp))
+                        Text("Copy", style = MaterialTheme.typography.labelSmall, color = CyberCyan)
+                    }
                 }
             }
             Text(
