@@ -540,6 +540,8 @@ private fun AuthenticatedStudioShell(
                             StudioScreen(
                                 clip = selectedClip,
                                 playbackUri = playbackUri,
+                                playbackUserAgent = analyzerState.resolvedInfo?.requiredUserAgent,
+                                playbackHeaders = analyzerState.resolvedInfo?.requiredHeaders.orEmpty(),
                                 pipeline = pipelineState,
                                 aiState = aiState,
                                 onUpdateClip = { clip, layout, hook, style, credit, chatOverlay, transcript ->

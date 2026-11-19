@@ -115,10 +115,10 @@ class Media3RenderEngine(private val context: Context) {
         captionHighlight: CaptionHighlightColor = CaptionHighlightColor.VIBRANT_YELLOW,
         isPreSlicedFile: Boolean = false,
         httpUserAgent: String? = null,
+        httpHeaders: Map<String, String> = emptyMap(),
         onProgress: (Float) -> Unit
     ): File {
         val effectiveUa = httpUserAgent?.takeIf { it.isNotBlank() } ?: DEFAULT_RENDER_USER_AGENT
-        // Proactively stage content:// URIs <= 200 MB to local cache to prevent PhotoPicker / Scoped Storage AssetLoader failures
         val initialUri = prepareSafeInputUri(inputUri, forceStageContent = false)
 
         return try {
@@ -129,6 +129,7 @@ class Media3RenderEngine(private val context: Context) {
                 captionHighlight = captionHighlight,
                 isPreSlicedFile = isPreSlicedFile,
                 userAgent = effectiveUa,
+                httpHeaders = httpHeaders,
                 onProgress = onProgress
             )
         } catch (primaryError: Exception) {
@@ -148,6 +149,7 @@ class Media3RenderEngine(private val context: Context) {
                     captionHighlight = captionHighlight,
                     isPreSlicedFile = isPreSlicedFile,
                     userAgent = effectiveUa,
+                    httpHeaders = httpHeaders,
                     onProgress = onProgress
                 )
             }
@@ -155,7 +157,7 @@ class Media3RenderEngine(private val context: Context) {
             if (canFallbackDownloadHttp) {
                 Log.w(TAG, "Direct HTTP stream render failed, caching remote MP4 to disk and retrying", primaryError)
                 onProgress(0.05f)
-                val cachedRemoteUri = downloadRemoteToCache(initialUri, effectiveUa)
+                val (cachedRemoteUri, httpErrDetail) = downloadRemoteToCache(initialUri, effectiveUa, httpHeaders)
                 if (cachedRemoteUri != null) {
                     return executeTransformerRender(
                         resolvedUri = cachedRemoteUri,
@@ -164,7 +166,14 @@ class Media3RenderEngine(private val context: Context) {
                         captionHighlight = captionHighlight,
                         isPreSlicedFile = isPreSlicedFile,
                         userAgent = effectiveUa,
+                        httpHeaders = httpHeaders,
                         onProgress = onProgress
+                    )
+                }
+                if (!httpErrDetail.isNullOrBlank()) {
+                    throw IllegalStateException(
+                        "${formatExportFailure(primaryError)} ($httpErrDetail)",
+                        primaryError
                     )
                 }
             }
@@ -181,9 +190,10 @@ class Media3RenderEngine(private val context: Context) {
         captionHighlight: CaptionHighlightColor,
         isPreSlicedFile: Boolean,
         userAgent: String,
+        httpHeaders: Map<String, String>,
         onProgress: (Float) -> Unit
     ): File {
-        val actualDurationMs = withContext(Dispatchers.IO) { probeDurationMs(resolvedUri, userAgent) }
+        val actualDurationMs = withContext(Dispatchers.IO) { probeDurationMs(resolvedUri, userAgent, httpHeaders) }
         val trimWindow = computeSafeTrimWindowMs(
             clipStartSec = clip.startSec,
             clipEndSec = clip.endSec,
@@ -241,6 +251,11 @@ class Media3RenderEngine(private val context: Context) {
                 .setAllowCrossProtocolRedirects(true)
                 .setConnectTimeoutMs(20_000)
                 .setReadTimeoutMs(30_000)
+                .apply {
+                    if (httpHeaders.isNotEmpty()) {
+                        setDefaultRequestProperties(httpHeaders)
+                    }
+                }
             val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
             val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
             val decoderFactory = DefaultDecoderFactory.Builder(context).build()
@@ -337,7 +352,7 @@ class Media3RenderEngine(private val context: Context) {
 
         val inputDir = File(context.cacheDir, "clipper/inputs").apply { mkdirs() }
         val stagedFile = File(inputDir, "local_${inputUri.toString().hashCode().toUInt()}.mp4")
-        if (stagedFile.exists() && stagedFile.length() > 0L) {
+        if (stagedFile.exists() && stagedFile.length() > 0L && probeDurationMs(Uri.fromFile(stagedFile), DEFAULT_RENDER_USER_AGENT, emptyMap()) != null) {
             return@withContext Uri.fromFile(stagedFile)
         }
 
@@ -351,25 +366,38 @@ class Media3RenderEngine(private val context: Context) {
         }.getOrElse { inputUri }
     }
 
-    private suspend fun downloadRemoteToCache(remoteUri: Uri, userAgent: String): Uri? = withContext(Dispatchers.IO) {
+    private suspend fun downloadRemoteToCache(
+        remoteUri: Uri,
+        userAgent: String,
+        httpHeaders: Map<String, String>
+    ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
         val url = remoteUri.toString()
         val inputDir = File(context.cacheDir, "clipper/inputs").apply { mkdirs() }
         val targetFile = File(inputDir, "remote_${url.hashCode().toUInt()}.mp4")
-        if (targetFile.exists() && targetFile.length() > 100_000L) {
-            return@withContext Uri.fromFile(targetFile)
+        if (targetFile.exists() && targetFile.length() > 100_000L &&
+            probeDurationMs(Uri.fromFile(targetFile), userAgent, emptyMap()) != null
+        ) {
+            return@withContext Uri.fromFile(targetFile) to null
         }
+        if (targetFile.exists()) targetFile.delete()
 
-        return@withContext runCatching {
-            val req = Request.Builder()
+        return@withContext try {
+            val reqBuilder = Request.Builder()
                 .url(url)
                 .header("User-Agent", userAgent)
-                .build()
-            downloadClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use null
-                val body = resp.body ?: return@use null
+            httpHeaders.forEach { (k, v) -> reqBuilder.header(k, v) }
+            downloadClient.newCall(reqBuilder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    return@use null to "HTTP ${resp.code} ${resp.message}"
+                }
+                val contentType = resp.header("Content-Type").orEmpty().lowercase()
+                if (contentType.startsWith("text/html")) {
+                    return@use null to "Server returned HTML instead of MP4"
+                }
+                val body = resp.body ?: return@use null to "Empty HTTP response body"
                 val maxCapBytes = 250_000_000L
                 val contentLen = body.contentLength()
-                if (contentLen > maxCapBytes) return@use null
+                if (contentLen > maxCapBytes) return@use null to "Remote MP4 exceeds 250MB cache limit"
                 body.byteStream().use { input ->
                     targetFile.outputStream().use { output ->
                         val buffer = ByteArray(64 * 1024)
@@ -383,24 +411,22 @@ class Media3RenderEngine(private val context: Context) {
                         }
                     }
                 }
-                if (targetFile.exists() && targetFile.length() > 10_000L) Uri.fromFile(targetFile) else null
+                if (targetFile.exists() && targetFile.length() > 10_000L) {
+                    Uri.fromFile(targetFile) to null
+                } else {
+                    targetFile.delete()
+                    null to "Downloaded stream was empty"
+                }
             }
-        }.getOrNull()
+        } catch (e: Exception) {
+            null to (e.localizedMessage ?: "Network download failed")
+        }
     }
 
-    private fun probeDurationMs(uri: Uri, userAgent: String): Long? {
+    private fun probeDurationMs(uri: Uri, userAgent: String, httpHeaders: Map<String, String>): Long? {
         val scheme = uri.scheme.orEmpty().lowercase()
         if (scheme == "http" || scheme == "https") {
-            if (".m3u8" in uri.toString().lowercase()) return null
-            val retriever = MediaMetadataRetriever()
-            return try {
-                retriever.setDataSource(uri.toString(), mapOf("User-Agent" to userAgent))
-                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
-            } catch (_: Exception) {
-                null
-            } finally {
-                runCatching { retriever.release() }
-            }
+            return null
         }
         val retriever = MediaMetadataRetriever()
         return try {

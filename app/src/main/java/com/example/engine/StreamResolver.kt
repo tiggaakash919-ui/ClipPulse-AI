@@ -41,6 +41,7 @@ data class ResolvedStreamInfo(
     val isLive: Boolean,
     val directPlayableUri: String? = null,
     val requiredUserAgent: String? = null,
+    val requiredHeaders: Map<String, String> = emptyMap(),
     val transcriptSegments: List<TranscriptSegment> = emptyList(),
     val heatmapMarkers: Map<Long, Double> = emptyMap(),
     val audioPeaks: List<ViralMomentEngine.AudioEnergyPoint> = emptyList(),
@@ -60,15 +61,27 @@ private data class InnertubeProfile(
     val clientVersion: String,
     val userAgent: String,
     val androidSdkVersion: Int? = null,
-    val deviceModel: String? = null
+    val deviceModel: String? = null,
+    val thirdPartyEmbedUrl: String? = null
 )
+
+private const val DEFAULT_MOBILE_UA =
+    "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36"
 
 class StreamResolver(private val context: Context) {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
         .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
+
+    private val probeClient = OkHttpClient.Builder()
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(8, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 
     fun detectPlatform(input: String): PlatformSource {
@@ -139,31 +152,43 @@ class StreamResolver(private val context: Context) {
         var hlsUrl: String? = null
         var progressiveMp4Url: String? = null
         var matchedUserAgent: String? = null
+        var matchedHeaders: Map<String, String> = emptyMap()
         var captionBaseUrl: String? = null
         var heatmap: Map<Long, Double> = emptyMap()
 
         val innertubeProfiles = listOf(
             InnertubeProfile(
                 clientName = "ANDROID_VR",
-                clientVersion = "1.56.21",
-                userAgent = "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                clientVersion = "1.57.29",
+                userAgent = "com.google.android.apps.youtube.vr.oculus/1.57.29 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
                 androidSdkVersion = 32
             ),
             InnertubeProfile(
+                clientName = "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                clientVersion = "2.0",
+                userAgent = "Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/537.36 Version/6.0 TV Safari/537.36",
+                thirdPartyEmbedUrl = "https://www.youtube.com/"
+            ),
+            InnertubeProfile(
                 clientName = "IOS",
-                clientVersion = "19.29.1",
-                userAgent = "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
+                clientVersion = "19.45.4",
+                userAgent = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)",
                 deviceModel = "iPhone16,2"
             ),
             InnertubeProfile(
                 clientName = "ANDROID",
-                clientVersion = "19.09.37",
-                userAgent = "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
-                androidSdkVersion = 30
+                clientVersion = "19.29.37",
+                userAgent = "com.google.android.youtube/19.29.37 (Linux; U; Android 13) gzip",
+                androidSdkVersion = 33
+            ),
+            InnertubeProfile(
+                clientName = "MWEB",
+                clientVersion = "2.20240726.00.00",
+                userAgent = DEFAULT_MOBILE_UA
             )
         )
 
-        // 1. Try YouTube Innertube player API across Android VR / iOS / Android profiles for un-ciphered MP4/HLS & captions
+        // 1. Try YouTube Innertube player API across multiple clients & verify each candidate URL returns HTTP 200/206
         if (videoId != null) {
             for (profile in innertubeProfiles) {
                 runCatching {
@@ -175,9 +200,19 @@ class StreamResolver(private val context: Context) {
                         profile.androidSdkVersion?.let { put("androidSdkVersion", it) }
                         profile.deviceModel?.let { put("deviceModel", it) }
                     }
+                    val contextObj = JSONObject().apply {
+                        put("client", clientObj)
+                        if (profile.thirdPartyEmbedUrl != null) {
+                            put("thirdParty", JSONObject().apply {
+                                put("embedUrl", profile.thirdPartyEmbedUrl)
+                            })
+                        }
+                    }
                     val payload = JSONObject().apply {
                         put("videoId", videoId)
-                        put("context", JSONObject().apply { put("client", clientObj) })
+                        put("context", contextObj)
+                        put("contentCheckOk", true)
+                        put("racyCheckOk", true)
                     }
                     val playerReq = Request.Builder()
                         .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
@@ -210,33 +245,49 @@ class StreamResolver(private val context: Context) {
                             }
                             val streamingData = root.optJSONObject("streamingData")
                             if (streamingData != null) {
-                                val foundHls = streamingData.optString("hlsManifestUrl").takeIf { it.startsWith("http") }
-                                if (hlsUrl == null && foundHls != null) {
-                                    hlsUrl = foundHls
-                                    if (matchedUserAgent == null) matchedUserAgent = profile.userAgent
-                                }
+                                val candidateMp4s = mutableListOf<Pair<Int, String>>()
                                 val formats = streamingData.optJSONArray("formats")
-                                if (formats != null && progressiveMp4Url == null) {
-                                    var fallbackUrl: String? = null
+                                if (formats != null) {
                                     for (i in 0 until formats.length()) {
                                         val fmt = formats.optJSONObject(i) ?: continue
                                         val mime = fmt.optString("mimeType")
                                         val directUrl = fmt.optString("url").takeIf { it.startsWith("http") } ?: continue
                                         if ("video/mp4" in mime) {
                                             val itag = fmt.optInt("itag", 0)
-                                            if (itag == 22 || itag == 37) {
-                                                progressiveMp4Url = directUrl
-                                                matchedUserAgent = profile.userAgent
-                                                break
-                                            }
-                                            if (fallbackUrl == null || itag == 18) {
-                                                fallbackUrl = directUrl
-                                            }
+                                            candidateMp4s.add(itag to directUrl)
                                         }
                                     }
-                                    if (progressiveMp4Url == null && fallbackUrl != null) {
-                                        progressiveMp4Url = fallbackUrl
+                                }
+                                // Sort 720p (22) -> 1080p (37) -> 360p (18) -> others, verify HTTP 200/206
+                                val prioritized = candidateMp4s.sortedBy { (itag, _) ->
+                                    when (itag) {
+                                        22 -> 0
+                                        37 -> 1
+                                        18 -> 2
+                                        else -> 3
+                                    }
+                                }
+                                val clientHeaders = if (profile.clientName.startsWith("TV") || profile.clientName == "MWEB") {
+                                    mapOf("Referer" to "https://www.youtube.com/", "Origin" to "https://www.youtube.com")
+                                } else emptyMap()
+
+                                for ((_, candidateUrl) in prioritized) {
+                                    if (verifyHttpStreamPlayable(candidateUrl, profile.userAgent, clientHeaders)) {
+                                        progressiveMp4Url = candidateUrl
                                         matchedUserAgent = profile.userAgent
+                                        matchedHeaders = clientHeaders
+                                        break
+                                    }
+                                }
+
+                                if (hlsUrl == null) {
+                                    val foundHls = streamingData.optString("hlsManifestUrl").takeIf { it.startsWith("http") }
+                                    if (foundHls != null && verifyHttpStreamPlayable(foundHls, profile.userAgent, clientHeaders)) {
+                                        hlsUrl = foundHls
+                                        if (matchedUserAgent == null) {
+                                            matchedUserAgent = profile.userAgent
+                                            matchedHeaders = clientHeaders
+                                        }
                                     }
                                 }
                             }
@@ -253,7 +304,7 @@ class StreamResolver(private val context: Context) {
         runCatching {
             val req = Request.Builder()
                 .url(normalizedUrl)
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36")
+                .header("User-Agent", DEFAULT_MOBILE_UA)
                 .header("Accept-Language", "en-US,en;q=0.9")
                 .build()
             client.newCall(req).execute().use { resp ->
@@ -275,9 +326,13 @@ class StreamResolver(private val context: Context) {
                         if (it > 0) duration = it
                     }
                 if (html.contains("\"isLive\":true")) isLive = true
-                if (hlsUrl == null) {
-                    hlsUrl = Regex("\"hlsManifestUrl\":\"([^\"]+)\"")
+                if (progressiveMp4Url == null && hlsUrl == null) {
+                    val htmlHls = Regex("\"hlsManifestUrl\":\"([^\"]+)\"")
                         .find(html)?.groupValues?.getOrNull(1)?.replace("\\u0026", "&")
+                    if (!htmlHls.isNullOrBlank() && verifyHttpStreamPlayable(htmlHls, DEFAULT_MOBILE_UA)) {
+                        hlsUrl = htmlHls
+                        matchedUserAgent = DEFAULT_MOBILE_UA
+                    }
                 }
                 heatmap = parseYouTubeHeatmap(html)
             }
@@ -285,9 +340,26 @@ class StreamResolver(private val context: Context) {
             Log.w(TAG, "YouTube watch HTML fetch warning: ${it.message}")
         }
 
+        // 3. Fallback when direct googlevideo.com URLs returned HTTP 403 (PO-Token enforced): try verified public resolvers
+        if (progressiveMp4Url == null && hlsUrl == null && videoId != null) {
+            val fallback = resolveYouTubeViaPublicFallback(videoId)
+            if (fallback != null) {
+                progressiveMp4Url = fallback.first
+                matchedUserAgent = fallback.second
+            }
+        }
+
         val transcript = if (!captionBaseUrl.isNullOrBlank()) fetchTimedTextTranscript(captionBaseUrl!!) else emptyList()
-        val segments = if (!hlsUrl.isNullOrBlank()) parseHlsManifest(hlsUrl!!) else emptyList()
-        val playableUri = progressiveMp4Url ?: hlsUrl
+        val segments = if (!hlsUrl.isNullOrBlank()) {
+            parseHlsManifest(hlsUrl!!, matchedUserAgent ?: DEFAULT_MOBILE_UA, matchedHeaders)
+        } else emptyList()
+
+        // Ensure HLS manifest itself has playable segments if progressive MP4 wasn't found
+        val verifiedHlsUrl = if (hlsUrl != null && (segments.isEmpty() || verifyHttpStreamPlayable(segments.first().url, matchedUserAgent ?: DEFAULT_MOBILE_UA, matchedHeaders))) {
+            hlsUrl
+        } else null
+
+        val playableUri = progressiveMp4Url ?: verifiedHlsUrl
         val handle = "@" + author.replace(Regex("[^A-Za-z0-9_]"), "").ifBlank { "Creator" }
 
         return ResolvedStreamInfo(
@@ -298,7 +370,8 @@ class StreamResolver(private val context: Context) {
             durationSec = duration.coerceAtLeast(30L),
             isLive = isLive,
             directPlayableUri = playableUri,
-            requiredUserAgent = matchedUserAgent,
+            requiredUserAgent = matchedUserAgent ?: DEFAULT_MOBILE_UA,
+            requiredHeaders = matchedHeaders,
             transcriptSegments = transcript,
             heatmapMarkers = heatmap,
             hlsSegments = segments.map { it.url },
@@ -307,11 +380,104 @@ class StreamResolver(private val context: Context) {
                 append("YouTube metadata fetched")
                 if (heatmap.isNotEmpty()) append(" • ${heatmap.size} Most-Replayed markers")
                 if (transcript.isNotEmpty()) append(" • ${transcript.size} spoken caption lines")
-                if (progressiveMp4Url != null) append(" • Direct MP4 stream ready")
-                else if (!hlsUrl.isNullOrBlank()) append(" • HLS stream ready")
-                else append(" • Stream protected/ciphered (pick Device Video or direct .mp4/.m3u8 URL to render)")
+                if (progressiveMp4Url != null) append(" • Verified MP4 stream ready (HTTP 200)")
+                else if (verifiedHlsUrl != null) append(" • Verified HLS stream ready")
+                else append(" • YouTube blocked direct streaming (HTTP 403 PO-Token/DRM). Pick Device Video or direct .mp4/.m3u8 URL to render.")
             }
         )
+    }
+
+    private fun resolveYouTubeViaPublicFallback(videoId: String): Pair<String, String>? {
+        val invidiousInstances = listOf(
+            "https://inv.nadeko.net",
+            "https://invidious.nerdvpn.de",
+            "https://yewtu.be"
+        )
+        for (base in invidiousInstances) {
+            val found = runCatching {
+                val req = Request.Builder()
+                    .url("$base/api/v1/videos/$videoId")
+                    .header("User-Agent", DEFAULT_MOBILE_UA)
+                    .header("Accept", "application/json")
+                    .build()
+                probeClient.newCall(req).execute().use { resp ->
+                    val body = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful || !body.startsWith("{")) return@use null
+                    val json = JSONObject(body)
+                    val streams = json.optJSONArray("formatStreams") ?: return@use null
+                    for (i in 0 until streams.length()) {
+                        val fmt = streams.optJSONObject(i) ?: continue
+                        val container = fmt.optString("container")
+                        if (container != "mp4" && !fmt.optString("type").contains("video/mp4")) continue
+                        val itag = fmt.optString("itag")
+                        val rawUrl = fmt.optString("url").takeIf { it.startsWith("http") }
+                        if (rawUrl != null && verifyHttpStreamPlayable(rawUrl, DEFAULT_MOBILE_UA)) {
+                            return@use rawUrl to DEFAULT_MOBILE_UA
+                        }
+                        if (itag.isNotBlank()) {
+                            val proxied = "$base/latest_version?id=$videoId&itag=$itag&local=true"
+                            if (verifyHttpStreamPlayable(proxied, DEFAULT_MOBILE_UA)) {
+                                return@use proxied to DEFAULT_MOBILE_UA
+                            }
+                        }
+                    }
+                    null
+                }
+            }.getOrNull()
+            if (found != null) return found
+        }
+        val pipedInstances = listOf(
+            "https://pipedapi.kavin.rocks",
+            "https://api.piped.private.coffee"
+        )
+        for (base in pipedInstances) {
+            val found = runCatching {
+                val req = Request.Builder()
+                    .url("$base/streams/$videoId")
+                    .header("User-Agent", DEFAULT_MOBILE_UA)
+                    .header("Accept", "application/json")
+                    .build()
+                probeClient.newCall(req).execute().use { resp ->
+                    val body = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful || !body.startsWith("{")) return@use null
+                    val json = JSONObject(body)
+                    val streams = json.optJSONArray("videoStreams") ?: return@use null
+                    for (i in 0 until streams.length()) {
+                        val fmt = streams.optJSONObject(i) ?: continue
+                        if (fmt.optBoolean("videoOnly", true)) continue
+                        val mime = fmt.optString("mimeType").lowercase()
+                        if ("mp4" !in mime) continue
+                        val rawUrl = fmt.optString("url").takeIf { it.startsWith("http") } ?: continue
+                        if (verifyHttpStreamPlayable(rawUrl, DEFAULT_MOBILE_UA)) {
+                            return@use rawUrl to DEFAULT_MOBILE_UA
+                        }
+                    }
+                    null
+                }
+            }.getOrNull()
+            if (found != null) return found
+        }
+        return null
+    }
+
+    private fun verifyHttpStreamPlayable(
+        url: String,
+        userAgent: String,
+        headers: Map<String, String> = emptyMap()
+    ): Boolean {
+        return runCatching {
+            val reqBuilder = Request.Builder()
+                .url(url)
+                .header("User-Agent", userAgent)
+                .header("Range", "bytes=0-2047")
+            headers.forEach { (k, v) -> reqBuilder.header(k, v) }
+            probeClient.newCall(reqBuilder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) return@use false
+                val contentType = resp.header("Content-Type").orEmpty().lowercase()
+                if (contentType.startsWith("text/html")) return@use false
+                true
+            }
+        }.getOrDefault(false)
     }
 
     private fun fetchTimedTextTranscript(baseUrl: String): List<TranscriptSegment> {
@@ -364,12 +530,14 @@ class StreamResolver(private val context: Context) {
 
     private fun resolveKick(url: String): ResolvedStreamInfo {
         val slug = url.substringAfter("kick.com/").substringBefore("/").substringBefore("?").trim()
+        val kickHeaders = mapOf("Referer" to "https://kick.com/", "Origin" to "https://kick.com")
         if (slug.isNotBlank() && !url.contains(".m3u8", true) && !url.contains(".mp4", true)) {
             runCatching {
                 val req = Request.Builder()
                     .url("https://kick.com/api/v2/channels/$slug")
-                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36")
+                    .header("User-Agent", DEFAULT_MOBILE_UA)
                     .header("Accept", "application/json")
+                    .header("Referer", "https://kick.com/")
                     .build()
                 client.newCall(req).execute().use { resp ->
                     val body = resp.body?.string().orEmpty()
@@ -379,7 +547,8 @@ class StreamResolver(private val context: Context) {
                         val livestream = json.optJSONObject("livestream")
                         val streamTitle = livestream?.optString("session_title")?.takeIf { it.isNotBlank() }
                             ?: "Kick Live — @$slug"
-                        val segments = if (playbackUrl != null) parseHlsManifest(playbackUrl) else emptyList()
+                        val verifiedUrl = playbackUrl?.takeIf { verifyHttpStreamPlayable(it, DEFAULT_MOBILE_UA, kickHeaders) }
+                        val segments = if (verifiedUrl != null) parseHlsManifest(verifiedUrl, DEFAULT_MOBILE_UA, kickHeaders) else emptyList()
                         return ResolvedStreamInfo(
                             sourceUrl = url,
                             platform = PlatformSource.KICK,
@@ -387,10 +556,12 @@ class StreamResolver(private val context: Context) {
                             streamerHandle = "@$slug",
                             durationSec = 1800L,
                             isLive = livestream != null,
-                            directPlayableUri = playbackUrl,
+                            directPlayableUri = verifiedUrl,
+                            requiredUserAgent = DEFAULT_MOBILE_UA,
+                            requiredHeaders = kickHeaders,
                             hlsSegments = segments.map { it.url },
                             sourceBytesEstimate = 900_000_000L,
-                            notes = if (playbackUrl != null) "Kick HLS stream resolved (${segments.size} segments)." else "Kick channel staged."
+                            notes = if (verifiedUrl != null) "Kick HLS stream resolved (${segments.size} segments)." else "Kick stream protected/offline."
                         )
                     }
                 }
@@ -404,6 +575,7 @@ class StreamResolver(private val context: Context) {
         if (".m3u8" in lower) {
             val segments = parseHlsManifest(url)
             val totalSec = segments.sumOf { it.durationSec }.toLong().coerceAtLeast(60L)
+            val playable = verifyHttpStreamPlayable(url, DEFAULT_MOBILE_UA)
             return ResolvedStreamInfo(
                 sourceUrl = url,
                 platform = platform,
@@ -411,37 +583,57 @@ class StreamResolver(private val context: Context) {
                 streamerHandle = if (platform == PlatformSource.KICK) "@KickStreamer" else "@StreamSource",
                 durationSec = totalSec,
                 isLive = segments.isNotEmpty(),
-                directPlayableUri = url,
+                directPlayableUri = if (playable) url else null,
+                requiredUserAgent = DEFAULT_MOBILE_UA,
                 hlsSegments = segments.map { it.url },
                 sourceBytesEstimate = totalSec * 650_000L,
-                notes = "Parsed ${segments.size} HLS segments (${totalSec}s)."
+                notes = if (playable) "Parsed ${segments.size} HLS segments (${totalSec}s)." else "HLS stream returned HTTP error or is unreachable."
             )
         }
 
+        val playable = verifyHttpStreamPlayable(url, DEFAULT_MOBILE_UA)
         var contentLength = 0L
-        runCatching {
-            val headReq = Request.Builder().url(url).head().build()
-            client.newCall(headReq).execute().use { resp ->
-                contentLength = resp.header("Content-Length")?.toLongOrNull() ?: 0L
+        if (playable) {
+            runCatching {
+                val headReq = Request.Builder().url(url).header("User-Agent", DEFAULT_MOBILE_UA).head().build()
+                probeClient.newCall(headReq).execute().use { resp ->
+                    contentLength = resp.header("Content-Length")?.toLongOrNull() ?: 0L
+                }
             }
+        }
+        var realDurationSec = 1200L
+        if (playable) {
+            val retriever = MediaMetadataRetriever()
+            runCatching {
+                retriever.setDataSource(url, mapOf("User-Agent" to DEFAULT_MOBILE_UA))
+                val ms = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+                if (ms != null && ms > 1000L) realDurationSec = (ms / 1000L).coerceAtLeast(5L)
+            }
+            runCatching { retriever.release() }
         }
         return ResolvedStreamInfo(
             sourceUrl = url,
             platform = platform,
             title = url.substringAfterLast('/').substringBefore('?').ifBlank { "Direct Stream" },
             streamerHandle = if (platform == PlatformSource.KICK) "@KickCreator" else "@StreamCreator",
-            durationSec = 1200L,
+            durationSec = realDurationSec,
             isLive = false,
-            directPlayableUri = url,
-            sourceBytesEstimate = if (contentLength > 0L) contentLength else 600_000_000L,
-            notes = if (contentLength > 0L) "Direct stream verified (${contentLength / (1024 * 1024)} MB); HTTP Range ready." else "Direct stream ready."
+            directPlayableUri = if (playable) url else null,
+            requiredUserAgent = DEFAULT_MOBILE_UA,
+            sourceBytesEstimate = if (contentLength > 0L) contentLength else realDurationSec * 500_000L,
+            notes = if (playable) "Direct stream verified (HTTP 200 • ${realDurationSec}s)." else "URL returned HTTP error / non-video response."
         )
     }
 
-    private fun parseHlsManifest(manifestUrl: String): List<HlsSegmentEntry> {
+    private fun parseHlsManifest(
+        manifestUrl: String,
+        userAgent: String = DEFAULT_MOBILE_UA,
+        headers: Map<String, String> = emptyMap()
+    ): List<HlsSegmentEntry> {
         return try {
-            val req = Request.Builder().url(manifestUrl).build()
-            client.newCall(req).execute().use { resp ->
+            val reqBuilder = Request.Builder().url(manifestUrl).header("User-Agent", userAgent)
+            headers.forEach { (k, v) -> reqBuilder.header(k, v) }
+            client.newCall(reqBuilder.build()).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful || body.isBlank()) return emptyList()
                 val baseUri = manifestUrl.substringBeforeLast('/') + "/"
@@ -450,7 +642,7 @@ class StreamResolver(private val context: Context) {
                 if (lines.any { it.startsWith("#EXT-X-STREAM-INF") }) {
                     val variantLine = lines.firstOrNull { !it.startsWith("#") }
                     if (variantLine != null) {
-                        return parseHlsManifest(resolveRelativeUrl(baseUri, variantLine))
+                        return parseHlsManifest(resolveRelativeUrl(baseUri, variantLine), userAgent, headers)
                     }
                 }
 
@@ -480,7 +672,9 @@ class StreamResolver(private val context: Context) {
         hlsSegments: List<String>,
         startSec: Long,
         endSec: Long,
-        clipId: String
+        clipId: String,
+        userAgent: String = DEFAULT_MOBILE_UA,
+        headers: Map<String, String> = emptyMap()
     ): Pair<File?, Long> = withContext(Dispatchers.IO) {
         val cacheDir = File(context.cacheDir, "clipper/clips").apply { mkdirs() }
         if (hlsSegments.isNotEmpty()) {
@@ -492,8 +686,9 @@ class StreamResolver(private val context: Context) {
             runCatching {
                 outFile.outputStream().use { out ->
                     for (segUrl in slice) {
-                        val req = Request.Builder().url(segUrl).build()
-                        client.newCall(req).execute().use { resp ->
+                        val reqBuilder = Request.Builder().url(segUrl).header("User-Agent", userAgent)
+                        headers.forEach { (k, v) -> reqBuilder.header(k, v) }
+                        client.newCall(reqBuilder.build()).execute().use { resp ->
                             if (resp.isSuccessful) {
                                 val bytes = resp.body?.bytes() ?: ByteArray(0)
                                 out.write(bytes)

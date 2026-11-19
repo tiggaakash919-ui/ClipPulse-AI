@@ -207,7 +207,10 @@ class ClipPulseViewModel(
     }
 
     fun updateSourceUrl(url: String) {
-        _analyzer.update { it.copy(sourceUrl = url, errorMessage = null) }
+        _analyzer.update { state ->
+            val keepLocal = state.localVideoUri?.takeIf { it.toString() == url }
+            state.copy(sourceUrl = url, localVideoUri = keepLocal, errorMessage = null)
+        }
     }
 
     fun updateIngestMode(mode: IngestMode) {
@@ -220,7 +223,7 @@ class ClipPulseViewModel(
 
     fun onSharedUrlReceived(url: String) {
         if (url.isNotBlank()) {
-            _analyzer.update { it.copy(sourceUrl = url.trim(), errorMessage = null) }
+            _analyzer.update { it.copy(sourceUrl = url.trim(), localVideoUri = null, errorMessage = null) }
             analyzeCurrentSource()
         }
     }
@@ -312,7 +315,9 @@ class ClipPulseViewModel(
                         hlsSegments = info.hlsSegments,
                         startSec = firstClip.startSec,
                         endSec = firstClip.endSec,
-                        clipId = firstClip.id
+                        clipId = firstClip.id,
+                        userAgent = info.requiredUserAgent ?: "Mozilla/5.0 (Linux; Android 15)",
+                        headers = info.requiredHeaders
                     )
                     val savedPct = if (info.sourceBytesEstimate > 0) {
                         ((1.0 - (dlBytes.toDouble() / info.sourceBytesEstimate.toDouble())) * 100.0).coerceIn(0.0, 99.9)
@@ -725,9 +730,38 @@ class ClipPulseViewModel(
                 captionHighlight = highlight,
                 isPreSlicedFile = false,
                 httpUserAgent = info?.requiredUserAgent,
+                httpHeaders = info?.requiredHeaders.orEmpty(),
                 onProgress = onProgress
             )
         } catch (primaryErr: Exception) {
+            val isRemoteScheme = primaryUri.scheme.equals("http", true) || primaryUri.scheme.equals("https", true)
+            val errMsg = primaryErr.message.orEmpty()
+            val isHttpStatusError = "BAD_HTTP_STATUS" in errMsg || "HTTP 403" in errMsg || "HTTP 410" in errMsg || "Source error" in errMsg
+
+            // Retry once with a freshly resolved stream URL in case signed googlevideo/CDN URL expired
+            if (isRemoteScheme && isHttpStatusError && !info?.sourceUrl.isNullOrBlank()) {
+                Log.w(TAG, "HTTP status error on render; refreshing stream URL and retrying", primaryErr)
+                onProgress(0.05f)
+                val refreshed = runCatching { streamResolver.resolveUrl(info!!.sourceUrl) }.getOrNull()
+                val freshUri = refreshed?.directPlayableUri?.let { Uri.parse(it) }
+                if (refreshed != null && freshUri != null) {
+                    _analyzer.update { it.copy(resolvedInfo = refreshed) }
+                    val retryResult = runCatching {
+                        renderEngine.renderVerticalShort(
+                            inputUri = freshUri,
+                            clip = clip,
+                            captionWords = words,
+                            captionHighlight = highlight,
+                            isPreSlicedFile = false,
+                            httpUserAgent = refreshed.requiredUserAgent,
+                            httpHeaders = refreshed.requiredHeaders,
+                            onProgress = onProgress
+                        )
+                    }
+                    if (retryResult.isSuccess) return retryResult.getOrThrow()
+                }
+            }
+
             val hlsSegs = info?.hlsSegments.orEmpty()
             if (hlsSegs.isNotEmpty()) {
                 Log.w(TAG, "Direct stream render failed; downloading HLS TS slice fallback", primaryErr)
@@ -737,7 +771,9 @@ class ClipPulseViewModel(
                     hlsSegments = hlsSegs,
                     startSec = clip.startSec,
                     endSec = clip.endSec,
-                    clipId = clip.id
+                    clipId = clip.id,
+                    userAgent = info?.requiredUserAgent ?: "Mozilla/5.0 (Linux; Android 15)",
+                    headers = info?.requiredHeaders.orEmpty()
                 )
                 if (tsFile != null && bytes > 0L) {
                     _pipeline.update {
@@ -756,6 +792,13 @@ class ClipPulseViewModel(
                         onProgress = onProgress
                     )
                 }
+            }
+
+            if (isRemoteScheme && isHttpStatusError) {
+                throw IllegalStateException(
+                    "Stream host blocked direct rendering (HTTP 403/expired link). Attach a Device Video or use a direct public .mp4/.m3u8 URL to render cleanly.",
+                    primaryErr
+                )
             }
             throw primaryErr
         }

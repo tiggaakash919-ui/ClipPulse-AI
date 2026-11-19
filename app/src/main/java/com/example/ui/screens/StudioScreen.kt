@@ -85,9 +85,14 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.annotation.OptIn
 import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import com.example.data.model.CaptionHighlightColor
 import com.example.data.model.HookBannerStyle
@@ -120,11 +125,14 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
 
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(UnstableApi::class)
+@kotlin.OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun StudioScreen(
     clip: ViralClip?,
     playbackUri: Uri?,
+    playbackUserAgent: String? = null,
+    playbackHeaders: Map<String, String> = emptyMap(),
     pipeline: PipelineMetrics,
     aiState: AiStudioUiState,
     onUpdateClip: (
@@ -248,12 +256,28 @@ fun StudioScreen(
     val effectivePlaybackUri = clip.localOutputPath?.takeIf { File(it).exists() }?.let { Uri.fromFile(File(it)) }
         ?: playbackUri
 
-    val exoPlayer = remember(effectivePlaybackUri) {
+    val exoPlayer = remember(effectivePlaybackUri, playbackUserAgent, playbackHeaders) {
         if (effectivePlaybackUri != null) {
-            ExoPlayer.Builder(context).build().apply {
-                setMediaItem(MediaItem.fromUri(effectivePlaybackUri))
-                prepare()
-            }
+            val httpFactory = DefaultHttpDataSource.Factory()
+                .setUserAgent(
+                    playbackUserAgent?.takeIf { it.isNotBlank() }
+                        ?: "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36"
+                )
+                .setAllowCrossProtocolRedirects(true)
+                .apply {
+                    if (playbackHeaders.isNotEmpty()) {
+                        setDefaultRequestProperties(playbackHeaders)
+                    }
+                }
+            val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
+            val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
+            ExoPlayer.Builder(context)
+                .setMediaSourceFactory(mediaSourceFactory)
+                .build()
+                .apply {
+                    setMediaItem(MediaItem.fromUri(effectivePlaybackUri))
+                    prepare()
+                }
         } else null
     }
     DisposableEffect(exoPlayer) {
@@ -500,7 +524,9 @@ fun StudioScreen(
                             style = MaterialTheme.typography.labelMedium
                         )
                     }
-                    if (effectivePlaybackUri == null) {
+                    val exportFailed = pipeline.exportStatus.contains("fail", true) ||
+                        pipeline.exportStatus.contains("error", true)
+                    if (effectivePlaybackUri == null || exportFailed) {
                         OutlinedButton(
                             onClick = {
                                 studioLocalVideoPicker.launch(
