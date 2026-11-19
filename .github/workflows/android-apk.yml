@@ -55,8 +55,19 @@ jobs:
             cp .env.example .env
           fi
 
-      - name: Assemble Debug APK and run unit tests
-        run: gradle :app:assembleDebug :app:testDebugUnitTest --no-daemon --stacktrace
+      - name: Cache Robolectric artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository/org/robolectric
+            ~/.robolectric
+          key: robolectric-cache-${{ runner.os }}-v1
+
+      - name: Run unit tests
+        run: gradle :app:testDebugUnitTest --no-daemon --stacktrace -Drobolectric.dependency.repo.url=https://maven-central.storage-download.googleapis.com/maven2
+
+      - name: Assemble Debug APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
 
       - name: Rename APK for download
         run: cp app/build/outputs/apk/debug/app-debug.apk ClipPulse-AI-debug.apk
